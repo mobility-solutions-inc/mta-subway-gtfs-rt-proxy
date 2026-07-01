@@ -14,7 +14,7 @@ import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
 
 const require = createRequire(import.meta.url)
-const pkg = require('../package.json') as {
+const pkg = require('../../package.json') as {
 	name: string
 	version: string
 }

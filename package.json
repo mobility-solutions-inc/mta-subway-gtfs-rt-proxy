@@ -67,7 +67,7 @@
 		"format:fix": "prettier --write . --ignore-path .prettierignore --ignore-path .gitignore",
 		"build:proto": "./build.sh",
 		"typecheck": "pnpm run build:proto && tsc --noEmit",
-		"build": "pnpm run build:proto && tsc && mkdir -p dist/lib && cp lib/mta-gtfs-realtime.pb.js lib/mta-gtfs-realtime.pb.d.ts dist/lib/",
+		"build": "pnpm run build:proto && tsc && mkdir -p dist/lib && cp lib/mta-gtfs-realtime.pb.js lib/mta-gtfs-realtime.pb.d.ts dist/lib/ && cp -R lib/postprocessing.d dist/lib/",
 		"check": "pnpm run format && pnpm run lint && pnpm run typecheck && pnpm run build && pnpm test",
 		"prepublishOnly": "pnpm run check"
 	}
