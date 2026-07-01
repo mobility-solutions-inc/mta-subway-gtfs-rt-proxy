@@ -1,0 +1,38 @@
+{
+	"compilerOptions": {
+		"allowJs": true,
+		"composite": true,
+		"declaration": true,
+		"declarationMap": true,
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"inlineSources": false,
+		"isolatedModules": true,
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"outDir": "dist",
+		"preserveWatchOutput": true,
+		"resolveJsonModule": true,
+		"rootDir": ".",
+		"skipLibCheck": true,
+		"strict": true,
+		"target": "ES2022",
+		"tsBuildInfoFile": ".cache/tsbuildinfo.json"
+	},
+	"include": [
+		"*.ts",
+		"example/**/*.ts",
+		"lib/**/*.ts",
+		"lib/mta-gtfs-realtime.pb.d.ts",
+		"test/**/*.ts",
+		"types/**/*.d.ts"
+	],
+	"exclude": [
+		".cache",
+		"dist",
+		"google-transit",
+		"node_modules",
+		"postgis-gtfs-importer",
+		"python-nyct-gtfs"
+	]
+}

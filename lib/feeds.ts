@@ -1,5 +1,17 @@
-const MTA_API_ACCESS_KEY = process.env.MTA_API_ACCESS_KEY || null
+const MTA_API_ACCESS_KEY = process.env.MTA_API_ACCESS_KEY ?? null
 // todo: MTA BusTime API key
+
+interface RealtimeFeedConfig {
+	realtimeFeedApiKey: string | null
+	realtimeFeedName: string
+	realtimeFeedUrl: string
+}
+
+interface ScheduleFeedConfig {
+	realtimeFeeds: RealtimeFeedConfig[]
+	scheduleFeedName: string
+	scheduleFeedUrl: string
+}
 
 // Note: We use the "supplemented" instead of the "regular" GTFS feed.
 // > Every day, the feed will contain a seven-day lookahead, so in principle a developer can download that and use it for the next seven days, then refresh the feed to get the next seven days – but we recommend updating more frequently (ideally daily) to get the latest updates and have valid data for the next seven days.
@@ -7,27 +19,24 @@ const MTA_API_ACCESS_KEY = process.env.MTA_API_ACCESS_KEY || null
 // > Outside of the seven-day window, the new supplemented feed will contain the same information as the existing static GTFS feed.
 // – https://groups.google.com/g/mtadeveloperresources/c/14d8DV4hnj4/m/cL0njuZdAwAJ
 const NYCT_SUBWAY_FEED_NAME = 'nyct_subway'
-const NYCT_SUBWAY_SCHEDULE_FEED_URL = (
-	process.env.NYCT_SUBWAY_SCHEDULE_FEED_URL ||
+const NYCT_SUBWAY_SCHEDULE_FEED_URL =
+	process.env.NYCT_SUBWAY_SCHEDULE_FEED_URL ??
 	'http://web.mta.info/developers/files/google_transit_supplemented.zip'
-)
 
-let NYCT_SUBWAY_1234567_REALTIME_FEED_URL = (
-	process.env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL ||
+let NYCT_SUBWAY_1234567_REALTIME_FEED_URL: string | null =
+	process.env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL ??
 	'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs'
-)
 if (NYCT_SUBWAY_1234567_REALTIME_FEED_URL === '-') {
 	NYCT_SUBWAY_1234567_REALTIME_FEED_URL = null
 }
-let NYCT_SUBWAY_ACE_REALTIME_FEED_URL = (
-	process.env.NYCT_SUBWAY_ACE_REALTIME_FEED_URL ||
+let NYCT_SUBWAY_ACE_REALTIME_FEED_URL: string | null =
+	process.env.NYCT_SUBWAY_ACE_REALTIME_FEED_URL ??
 	'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace'
-)
 if (NYCT_SUBWAY_ACE_REALTIME_FEED_URL === '-') {
 	NYCT_SUBWAY_ACE_REALTIME_FEED_URL = null
 }
 
-const NYCT_SUBWAY_FEED = {
+const NYCT_SUBWAY_FEED: ScheduleFeedConfig = {
 	scheduleFeedName: NYCT_SUBWAY_FEED_NAME,
 	scheduleFeedUrl: NYCT_SUBWAY_SCHEDULE_FEED_URL,
 	realtimeFeeds: [
@@ -42,15 +51,12 @@ const NYCT_SUBWAY_FEED = {
 			realtimeFeedApiKey: MTA_API_ACCESS_KEY,
 		},
 		// todo: add the missing ones
-	].filter(({realtimeFeedUrl}) => realtimeFeedUrl !== null),
+	].filter((feed): feed is RealtimeFeedConfig => feed.realtimeFeedUrl !== null),
 }
 
-const ALL_FEEDS = [
+const ALL_FEEDS: ScheduleFeedConfig[] = [
 	NYCT_SUBWAY_FEED,
 	// todo: bus, etc.
 ]
 
-export {
-	NYCT_SUBWAY_FEED,
-	ALL_FEEDS,
-}
+export { NYCT_SUBWAY_FEED, ALL_FEEDS }

@@ -1,9 +1,16 @@
-import {Counter, Summary} from 'prom-client'
-import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
-import {register as metricsRegister} from './metrics.js'
-import {queryScheduleStopTimes} from './query-schedule-stop-times.js'
+import { Counter, Summary } from 'prom-client'
 
-const {ScheduleRelationship} = gtfsRtBindings.transit_realtime.TripDescriptor
+import type {
+	MatchConfig,
+	MatchOptions,
+	ScheduleStopTime,
+	VehiclePosition,
+} from './types.js'
+import { register as metricsRegister } from './metrics.js'
+import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
+import { queryScheduleStopTimes } from './query-schedule-stop-times.js'
+
+const { ScheduleRelationship } = gtfsRtBindings.transit_realtime.TripDescriptor
 
 // see also https://www.robustperception.io/cardinality-is-key/
 const dbQueryTimeSeconds = new Summary({
@@ -21,35 +28,24 @@ const matchingSuccesses = new Counter({
 	name: 'vehiclepositions_matching_successes_total',
 	help: 'number of successfully matched VehiclePositions',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-		'matching_method',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id', 'matching_method'],
 })
 const matchingFailures = new Counter({
 	name: 'vehiclepositions_matching_failures_total',
 	help: 'number of successfully matched VehiclePositions',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-		'matching_method',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id', 'matching_method'],
 })
 
-const createMatchVehiclePosition = (cfg) => {
-	const {
-		scheduleFeedDigest, scheduleFeedDigestSlice,
-		db,
-		logger,
-	} = cfg
+const createMatchVehiclePosition = (cfg: MatchConfig) => {
+	const { scheduleFeedDigest, scheduleFeedDigestSlice, db, logger } = cfg
 
 	// Note: This function mutates `vehiclePosition`.
-	const matchVehiclePosition = async (vehiclePosition, opt = {}) => {
-		const {
-			realtimeFeedName,
-		} = {
+	const matchVehiclePosition = async (
+		vehiclePosition: VehiclePosition,
+		opt: MatchOptions = {},
+	) => {
+		const { realtimeFeedName } = {
 			realtimeFeedName: null,
 			...opt,
 		}
@@ -59,13 +55,18 @@ const createMatchVehiclePosition = (cfg) => {
 			start_date: startDate,
 			trip_id: realtimeTripId,
 		} = vehiclePosition.trip
-		const {
-			stop_id,
-			current_stop_sequence = null,
-		} = vehiclePosition
-		const nyctTripDescriptor = vehiclePosition.trip['.nyct_trip_descriptor'] || null
+		if (!route_id || !startDate || !realtimeTripId) {
+			logger.warn(
+				{ scheduleFeedDigest, realtimeFeedName },
+				'cannot match VehiclePosition with incomplete trip descriptor',
+			)
+			return null
+		}
+		const { stop_id, current_stop_sequence = null } = vehiclePosition
+		const nyctTripDescriptor =
+			vehiclePosition.trip['.nyct_trip_descriptor'] ?? null
 
-		const logCtx = {
+		const logCtx: Record<string, unknown> = {
 			scheduleFeedDigest,
 			realtimeFeedName,
 			routeId: route_id,
@@ -73,12 +74,16 @@ const createMatchVehiclePosition = (cfg) => {
 			startDate,
 			realtimeTripId,
 		}
-		logger.trace({
-			...logCtx,
-			vehiclePosition,
-		}, 'matching VehiclePosition')
+		logger.trace(
+			{
+				...logCtx,
+				vehiclePosition,
+			},
+			'matching VehiclePosition',
+		)
 
-		const isMatch = scheduleStopTimes => scheduleStopTimes.length === 1
+		const isMatch = (scheduleStopTimes: ScheduleStopTime[]) =>
+			scheduleStopTimes.length === 1
 		const scheduleStopTimes = await queryScheduleStopTimes({
 			logger,
 			route_id,
@@ -101,16 +106,22 @@ const createMatchVehiclePosition = (cfg) => {
 		})
 
 		if (scheduleStopTimes.length === 0) {
-			logger.warn(logCtx, 'failed to find matching schedule trip for VehiclePosition')
+			logger.warn(
+				logCtx,
+				'failed to find matching schedule trip for VehiclePosition',
+			)
 			// todo: if trip is duplicated/added, provide TripProperties.{trip_id,start_date,start_time,shape_id}?
 			return null
 		}
 		if (scheduleStopTimes.length > 1) {
 			// todo: add a metric for this
-			logger.warn({
-				...logCtx,
-				scheduleStopTimes,
-			}, 'failed to find unambiguously matching schedule trip for VehiclePosition')
+			logger.warn(
+				{
+					...logCtx,
+					scheduleStopTimes,
+				},
+				'failed to find unambiguously matching schedule trip for VehiclePosition',
+			)
 			return null
 		}
 
@@ -131,9 +142,7 @@ const createMatchVehiclePosition = (cfg) => {
 
 		// fill VehicleDescriptor.id using nyctTripDescriptor.train_id
 		if (!vehiclePosition.vehicle?.id && nyctTripDescriptor?.train_id) {
-			if (!vehiclePosition.vehicle) {
-				vehiclePosition.vehicle = {}
-			}
+			vehiclePosition.vehicle ??= {}
 			vehiclePosition.vehicle.id = nyctTripDescriptor?.train_id
 		}
 	}
@@ -143,6 +152,4 @@ const createMatchVehiclePosition = (cfg) => {
 	}
 }
 
-export {
-	createMatchVehiclePosition,
-}
+export { createMatchVehiclePosition }

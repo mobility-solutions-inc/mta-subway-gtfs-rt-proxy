@@ -1,29 +1,33 @@
-import {promisify} from 'node:util'
-import {after, test} from 'node:test'
+import { deepStrictEqual, ok, strictEqual } from 'node:assert'
+import { after, test } from 'node:test'
+import { promisify } from 'node:util'
+import type { QueryResultRow } from 'pg'
 import cloneDeep from 'lodash/cloneDeep.js'
-import {
-	createParseAndProcessFeed,
-} from '../lib/match.js'
-import {deepStrictEqual, ok, strictEqual} from 'node:assert'
 import sortBy from 'lodash/sortBy.js'
-import gtfsRtBindings from '../lib/mta-gtfs-realtime.pb.js'
-import {connectToPostgres} from '../lib/db.js'
-import {_restoreStopTimeUpdate} from '../lib/restore-stoptimeupdates.js'
 
-const {ScheduleRelationship} = gtfsRtBindings.transit_realtime.TripDescriptor
+import { connectToPostgres } from '../lib/db.js'
+import { createParseAndProcessFeed } from '../lib/match.js'
+import gtfsRtBindings from '../lib/mta-gtfs-realtime.pb.js'
+import { _restoreStopTimeUpdate } from '../lib/restore-stoptimeupdates.js'
+
+const { ScheduleRelationship } = gtfsRtBindings.transit_realtime.TripDescriptor
 
 const SCHEDULE_DB_NAME = process.env.PGDATABASE
 ok(SCHEDULE_DB_NAME, 'SCHEDULE_DB_NAME')
 const SCHEDULE_FEED_DIGEST = 'ce8d9c' // first 3 bytes of SHA-256 hash
 const SCHEDULE_FEED_DIGEST_SLICE = SCHEDULE_FEED_DIGEST.slice(0, 1)
 
-const tripUpdate072350_1_N03RScheduleTripId = 'AFA23GEN-1092-Weekday-00_072350_1..N03R'
+const tripUpdate072350_1_N03RScheduleTripId =
+	'AFA23GEN-1092-Weekday-00_072350_1..N03R'
 const tripUpdate072350_1_N03R = {
 	trip: {
 		trip_id: '072350_1..N03R',
 		start_date: '20240320',
 		route_id: '1',
-		'.nyct_trip_descriptor': { train_id: '01 1203+ SFT/242', is_assigned: true },
+		'.nyct_trip_descriptor': {
+			train_id: '01 1203+ SFT/242',
+			is_assigned: true,
+		},
 	},
 	stop_time_update: [
 		{
@@ -54,7 +58,7 @@ const tripUpdate072350_1_N03RMatched = {
 		schedule_relationship: 0,
 	},
 	vehicle: {
-		id: '01 1203+ SFT/242'
+		id: '01 1203+ SFT/242',
 	},
 	stop_time_update: [
 		{
@@ -96,7 +100,8 @@ const tripUpdate072350_1_N03RMatched = {
 	delay: 319,
 }
 
-const vehiclePosition075150_1_S03RScheduleTripId = 'AFA23GEN-1092-Weekday-00_075150_1..S03R'
+const vehiclePosition075150_1_S03RScheduleTripId =
+	'AFA23GEN-1092-Weekday-00_075150_1..S03R'
 const vehiclePosition075150_1_S03R = {
 	trip: {
 		trip_id: '075150_1..S03R',
@@ -105,7 +110,7 @@ const vehiclePosition075150_1_S03R = {
 		'.nyct_trip_descriptor': {
 			train_id: '01 1231+ 242/SFT',
 			is_assigned: true,
-			direction: 3
+			direction: 3,
 		},
 	},
 	current_stop_sequence: 17,
@@ -125,8 +130,6 @@ const vehiclePosition075150_1_S03RMatched = {
 	},
 }
 
-const alert0Entity0ScheduleTripId = 'todo' // todo
-const alert0Entity1ScheduleTripId = 'todo' // todo
 const alert0 = {
 	informed_entity: [
 		{
@@ -151,9 +154,7 @@ const alert0 = {
 		},
 	],
 	header_text: {
-		translation: [
-			{text: 'Train delayed'},
-		],
+		translation: [{ text: 'Train delayed' }],
 	},
 }
 const alert0Matched = {
@@ -219,14 +220,16 @@ const feedMessage1Matched = {
 		'.nyct_feed_header': {
 			...feedMessage0Matched.header['.nyct_feed_header'],
 			trip_replacement_period: [
-				{ // overlaps with `tripUpdate072350_1_N03R` & `vehiclePosition075150_1_S03R`
+				{
+					// overlaps with `tripUpdate072350_1_N03R` & `vehiclePosition075150_1_S03R`
 					route_id: '1',
 					replacement_period: {
 						start: 1710952410n, // 2024-03-20T12:33:30-04:00
 						end: 1710952471n, // 2024-03-20T12:34:31-04:00
 					},
 				},
-				{ // overlaps with no feed entity
+				{
+					// overlaps with no feed entity
 					route_id: '4',
 					replacement_period: {
 						start: 1710954410n, // 2024-03-20T13:06:50-04:00
@@ -238,10 +241,15 @@ const feedMessage1Matched = {
 	},
 }
 
-const queryDbOnce = async (...queryArgs) => {
+const queryDbOnce = async <TRow extends QueryResultRow = QueryResultRow>(
+	text: string,
+	values?: unknown[],
+) => {
 	const db = await connectToPostgres()
 	try {
-		return await db.query(...queryArgs)
+		return values === undefined
+			? await db.query<TRow>(text)
+			: await db.query<TRow>(text, values)
 	} finally {
 		await promisify(db.end.bind(db))()
 	}
@@ -269,33 +277,33 @@ after(async () => {
 	await stopMatching()
 })
 
-test('matching an N03R TripUpdate works', async (t) => {
+test('matching an N03R TripUpdate works', async () => {
 	const now = 1710953000_000
 
 	const tripUpdate = cloneDeep(tripUpdate072350_1_N03R)
-	await matchTripUpdate(tripUpdate, {now})
+	await matchTripUpdate(tripUpdate, { now })
 
 	deepStrictEqual(tripUpdate, tripUpdate072350_1_N03RMatched)
 })
 
-test('matching N03R TripUpdate still happens if it has the Schedule trip_id', async (t) => {
+test('matching N03R TripUpdate still happens if it has the Schedule trip_id', async () => {
 	const now = 1710953000_000
 
 	const tripUpdate = cloneDeep(tripUpdate072350_1_N03R)
 	tripUpdate.trip.trip_id = tripUpdate072350_1_N03RScheduleTripId
-	await matchTripUpdate(tripUpdate, {now})
+	await matchTripUpdate(tripUpdate, { now })
 
 	deepStrictEqual(tripUpdate, tripUpdate072350_1_N03RMatched)
 })
 
-test('matching a S03R VehiclePosition works', async (t) => {
+test('matching a S03R VehiclePosition works', async () => {
 	const vehiclePosition = cloneDeep(vehiclePosition075150_1_S03R)
 	await matchVehiclePosition(vehiclePosition)
 
 	deepStrictEqual(vehiclePosition, vehiclePosition075150_1_S03RMatched)
 })
 
-test('matchTripUpdate() correctly filter by suffix', async (t) => {
+test('matchTripUpdate() correctly filter by suffix', async () => {
 	const now = 1710953000_000
 	const prefixed = {
 		...tripUpdate072350_1_N03R,
@@ -306,12 +314,16 @@ test('matchTripUpdate() correctly filter by suffix', async (t) => {
 	}
 
 	const tripUpdate = cloneDeep(prefixed)
-	await matchTripUpdate(tripUpdate, {now})
-	strictEqual(tripUpdate.trip.trip_id, prefixed.trip.trip_id, 'TripUpdate must not be matched')
+	await matchTripUpdate(tripUpdate, { now })
+	strictEqual(
+		tripUpdate.trip.trip_id,
+		prefixed.trip.trip_id,
+		'TripUpdate must not be matched',
+	)
 })
 
 // todo
-test.skip('matching an Alert affecting S03R & N03R works', async (t) => {
+test.skip('matching an Alert affecting S03R & N03R works', async () => {
 	const alert = cloneDeep(alert0)
 	await matchAlert(alert)
 
@@ -341,18 +353,16 @@ test.skip('matching an Alert affecting S03R & N03R works', async (t) => {
 			},
 		],
 		header_text: {
-			translation: [
-				{text: 'Train delayed'},
-			],
+			translation: [{ text: 'Train delayed' }],
 		},
 	})
 })
 
-test('matching a FeedMessage works', async (t) => {
+test('matching a FeedMessage works', async () => {
 	const now = 1710953000_000
 
 	const feedMessage = cloneDeep(feedMessage0)
-	await matchFeedMessage(feedMessage, {now})
+	await matchFeedMessage(feedMessage, { now })
 
 	// assert that matching has succeeded by checking for GTFS Schedule trip IDs
 
@@ -360,6 +370,7 @@ test('matching a FeedMessage works', async (t) => {
 
 	{
 		const tripUpdate = feedMessage.entity[0].trip_update
+		ok(tripUpdate, 'feedMessage.entity[0].trip_update')
 		strictEqual(
 			tripUpdate.trip.trip_id,
 			tripUpdate072350_1_N03RScheduleTripId,
@@ -369,6 +380,7 @@ test('matching a FeedMessage works', async (t) => {
 
 	{
 		const vehiclePosition = feedMessage.entity[1].vehicle
+		ok(vehiclePosition, 'feedMessage.entity[1].vehicle')
 		strictEqual(
 			vehiclePosition.trip.trip_id,
 			vehiclePosition075150_1_S03RScheduleTripId,
@@ -392,7 +404,7 @@ test('matching a FeedMessage works', async (t) => {
 	// }
 })
 
-test('StopTimeUpdates restoring logic works', (t) => {
+test('StopTimeUpdates restoring logic works', () => {
 	const timestamp = 1234567n
 	const _stopTimeUpdate1 = tripUpdate072350_1_N03R.stop_time_update[1]
 	const _scheduleStopTimeUpdate1 = {
@@ -406,10 +418,11 @@ test('StopTimeUpdates restoring logic works', (t) => {
 		departure_delay: 234n,
 	}
 
-	{ // Realtime `arrival: null`
+	{
+		// Realtime `arrival: null`
 		const stopTimeUpdate1 = cloneDeep({
 			..._stopTimeUpdate1,
-			arrival: null
+			arrival: null,
 		})
 		const scheduleStopTimeUpdate1 = cloneDeep(_scheduleStopTimeUpdate1)
 		_restoreStopTimeUpdate(stopTimeUpdate1, timestamp, scheduleStopTimeUpdate1)
@@ -418,7 +431,8 @@ test('StopTimeUpdates restoring logic works', (t) => {
 			// no delay field
 		})
 	}
-	{ // Realtime `arrival.time: null` & `arrival.delay: null`
+	{
+		// Realtime `arrival.time: null` & `arrival.delay: null`
 		const stopTimeUpdate1 = cloneDeep({
 			..._stopTimeUpdate1,
 			arrival: {
@@ -433,7 +447,8 @@ test('StopTimeUpdates restoring logic works', (t) => {
 			// no delay field
 		})
 	}
-	{ // Realtime timestamp older than Schedule timestamp
+	{
+		// Realtime timestamp older than Schedule timestamp
 		const stopTimeUpdate1 = cloneDeep(_stopTimeUpdate1)
 		const scheduleStopTimeUpdate1 = cloneDeep({
 			..._scheduleStopTimeUpdate1,
@@ -445,17 +460,19 @@ test('StopTimeUpdates restoring logic works', (t) => {
 			// no delay field
 		})
 	}
-	{ // Realtime arrival unchanged
+	{
+		// Realtime arrival unchanged
 		const stopTimeUpdate1 = cloneDeep(_stopTimeUpdate1)
 		const scheduleStopTimeUpdate1 = cloneDeep(_scheduleStopTimeUpdate1)
 		_restoreStopTimeUpdate(stopTimeUpdate1, timestamp, scheduleStopTimeUpdate1)
 		deepStrictEqual(stopTimeUpdate1.arrival, _stopTimeUpdate1.arrival)
 	}
 
-	{ // Realtime `departure: null`
+	{
+		// Realtime `departure: null`
 		const stopTimeUpdate1 = cloneDeep({
 			..._stopTimeUpdate1,
-			departure: null
+			departure: null,
 		})
 		const scheduleStopTimeUpdate1 = cloneDeep(_scheduleStopTimeUpdate1)
 		_restoreStopTimeUpdate(stopTimeUpdate1, timestamp, scheduleStopTimeUpdate1)
@@ -464,7 +481,8 @@ test('StopTimeUpdates restoring logic works', (t) => {
 			// no delay field
 		})
 	}
-	{ // Realtime `departure.time: null` & `departure.delay: null`
+	{
+		// Realtime `departure.time: null` & `departure.delay: null`
 		const stopTimeUpdate1 = cloneDeep({
 			..._stopTimeUpdate1,
 			departure: {
@@ -479,7 +497,8 @@ test('StopTimeUpdates restoring logic works', (t) => {
 			// no delay field
 		})
 	}
-	{ // Realtime timestamp older than Schedule timestamp
+	{
+		// Realtime timestamp older than Schedule timestamp
 		const stopTimeUpdate1 = cloneDeep(_stopTimeUpdate1)
 		const scheduleStopTimeUpdate1 = cloneDeep({
 			..._scheduleStopTimeUpdate1,
@@ -491,7 +510,8 @@ test('StopTimeUpdates restoring logic works', (t) => {
 			// no delay field
 		})
 	}
-	{ // Realtime departure unchanged
+	{
+		// Realtime departure unchanged
 		const stopTimeUpdate1 = cloneDeep(_stopTimeUpdate1)
 		const scheduleStopTimeUpdate1 = cloneDeep(_scheduleStopTimeUpdate1)
 		_restoreStopTimeUpdate(stopTimeUpdate1, timestamp, scheduleStopTimeUpdate1)
@@ -501,7 +521,7 @@ test('StopTimeUpdates restoring logic works', (t) => {
 	// todo: other cases?
 })
 
-test('storing current & restoring previous StopTimeUpdates works', async (t) => {
+test('storing current & restoring previous StopTimeUpdates works', async () => {
 	await clearPreviousStopTimeUpdatesDb()
 	try {
 		// 1. store TripUpdate's StopTimeUpdates in the DB
@@ -512,18 +532,20 @@ test('storing current & restoring previous StopTimeUpdates works', async (t) => 
 
 			// todo
 			// We expect only the (single) TripUpdate (0th feed entity) to be in here, as restoring StopTimeUpdates only makes sense for TripUpdates.
-			const bigintToNumber = bi => parseInt(String(bi), 10)
-			const expectedStopTimeUpdates = tripUpdate072350_1_N03R.stop_time_update.map((sTU) => ({
-				stop_id: sTU.stop_id,
-				timestamp: bigintToNumber(feedMessage0.header.timestamp),
-				arrival_time: bigintToNumber(sTU.arrival.time),
-				arrival_delay: null, // we didn't provide this before
-				departure_time: sTU.departure?.time ? bigintToNumber(sTU.departure.time) : null,
-				departure_delay: null, // we didn't provide this before
-			}))
-			const {
-				rows: storedStopTimeUpdates,
-			} = await queryDbOnce(`\
+			const bigintToNumber = (bi: bigint | number) => parseInt(String(bi), 10)
+			const expectedStopTimeUpdates =
+				tripUpdate072350_1_N03R.stop_time_update.map((sTU) => ({
+					stop_id: sTU.stop_id,
+					timestamp: bigintToNumber(feedMessage0.header.timestamp),
+					arrival_time: bigintToNumber(sTU.arrival.time),
+					arrival_delay: null, // we didn't provide this before
+					departure_time: sTU.departure?.time
+						? bigintToNumber(sTU.departure.time)
+						: null,
+					departure_delay: null, // we didn't provide this before
+				}))
+			const { rows: storedStopTimeUpdates } = await queryDbOnce(
+				`\
 				SELECT
 					stop_id,
 					timestamp,
@@ -535,13 +557,15 @@ test('storing current & restoring previous StopTimeUpdates works', async (t) => 
 				WHERE trip_id = $1
 				AND start_date = $2
 				ORDER BY stop_id
-			`, [
-				tripUpdate072350_1_N03R.trip.trip_id,
-				tripUpdate072350_1_N03R.trip.start_date,
-			])
+			`,
+				[
+					tripUpdate072350_1_N03R.trip.trip_id,
+					tripUpdate072350_1_N03R.trip.start_date,
+				],
+			)
 			deepStrictEqual(
 				storedStopTimeUpdates,
-				sortBy(expectedStopTimeUpdates, ({stop_id}) => stop_id),
+				sortBy(expectedStopTimeUpdates, ({ stop_id }) => stop_id),
 				'stored StopTimeUpdates seem wrong',
 			)
 		}
@@ -550,8 +574,8 @@ test('storing current & restoring previous StopTimeUpdates works', async (t) => 
 		{
 			const newStopTimeUpdate = {
 				stop_id: 'some-random-stop-id',
-				arrival: {time: 1710954123n},
-				departure: {time: 1710954234n},
+				arrival: { time: 1710954123n },
+				departure: { time: 1710954234n },
 			}
 			const feedMessageRestored = cloneDeep({
 				...feedMessage0,
@@ -562,13 +586,15 @@ test('storing current & restoring previous StopTimeUpdates works', async (t) => 
 							...tripUpdate072350_1_N03R,
 							// todo: modify timestamp!
 							stop_time_update: [
-								{ // STU #0: remove departure_time
+								{
+									// STU #0: remove departure_time
 									...tripUpdate072350_1_N03R.stop_time_update[0],
-									departure: {time: null},
+									departure: { time: null },
 								},
-								{ // STU #1: remove arrival_time
+								{
+									// STU #1: remove arrival_time
 									...tripUpdate072350_1_N03R.stop_time_update[1],
-									arrival: {time: null},
+									arrival: { time: null },
 								},
 								newStopTimeUpdate,
 								// all other STUs: keep as-is
@@ -582,6 +608,8 @@ test('storing current & restoring previous StopTimeUpdates works', async (t) => 
 
 			const tripUpdate0Restored = feedMessageRestored.entity[0].trip_update
 			const tripUpdate0Expected = feedMessage0.entity[0].trip_update
+			ok(tripUpdate0Restored, 'feedMessageRestored.entity[0].trip_update')
+			ok(tripUpdate0Expected, 'feedMessage0.entity[0].trip_update')
 
 			deepStrictEqual(
 				tripUpdate0Restored.stop_time_update[0],
@@ -606,7 +634,7 @@ test('storing current & restoring previous StopTimeUpdates works', async (t) => 
 	}
 })
 
-test('applying FeedReplacementPeriods works', async (t) => {
+test('applying FeedReplacementPeriods works', async () => {
 	const feedMessage = cloneDeep(feedMessage1Matched)
 	await applyTripReplacementPeriods(feedMessage)
 
@@ -635,25 +663,23 @@ test('applying FeedReplacementPeriods works', async (t) => {
 		([_, __, start_date]) => start_date,
 	)
 
-	const expectedAddFeedEntities = expectedCanceled
-	.map(([route_id, trip_id, start_date, start_time]) => ({
-		id: `canceled-${start_date}-${trip_id}`,
-		trip_update: {
-			trip: {
-				trip_id,
-				route_id,
-				start_date,
-				start_time,
-				schedule_relationship: ScheduleRelationship.CANCELED,
+	const expectedAddFeedEntities = expectedCanceled.map(
+		([route_id, trip_id, start_date, start_time]) => ({
+			id: `canceled-${start_date}-${trip_id}`,
+			trip_update: {
+				trip: {
+					trip_id,
+					route_id,
+					start_date,
+					start_time,
+					schedule_relationship: ScheduleRelationship.CANCELED,
+				},
 			},
-		},
-	}))
+		}),
+	)
 	const expectedFeedMessage = {
 		...feedMessage1Matched,
-		entity: [
-			...expectedAddFeedEntities,
-			...feedMessage1Matched.entity,
-		],
+		entity: [...expectedAddFeedEntities, ...feedMessage1Matched.entity],
 	}
 
 	deepStrictEqual(feedMessage, expectedFeedMessage)

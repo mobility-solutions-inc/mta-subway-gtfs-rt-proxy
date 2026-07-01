@@ -1,7 +1,7 @@
-import {ok} from 'node:assert'
-import {Counter, Summary} from 'prom-client'
-import {register as metricsRegister} from './metrics.js'
-import {queryScheduleStopTimes} from './query-schedule-stop-times.js'
+import { Counter, Summary } from 'prom-client'
+
+import type { Alert, MatchConfig, MatchOptions } from './types.js'
+import { register as metricsRegister } from './metrics.js'
 
 // const queryScheduleTrip = async (cfg) => {
 // 	const {
@@ -62,7 +62,7 @@ import {queryScheduleStopTimes} from './query-schedule-stop-times.js'
 // 	return null
 // }
 
-const dbQueryTimeSeconds = new Summary({
+const _dbQueryTimeSeconds = new Summary({
 	name: 'alerts_matching_db_query_time_seconds',
 	help: 'when matching Alerts, for how long GTFS Schedule stop_times are queried from the database',
 	registers: [metricsRegister],
@@ -73,40 +73,25 @@ const dbQueryTimeSeconds = new Summary({
 		'success',
 	],
 })
-const matchingSuccesses = new Counter({
+const _matchingSuccesses = new Counter({
 	name: 'alerts_matching_successes_total',
 	help: 'number of successfully matched Alerts',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-		'matching_method',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id', 'matching_method'],
 })
-const matchingFailures = new Counter({
+const _matchingFailures = new Counter({
 	name: 'alerts_matching_failures_total',
 	help: 'number of successfully matched Alerts',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-		'matching_method',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id', 'matching_method'],
 })
 
-const createMatchAlert = (cfg) => {
-	const {
-		scheduleFeedDigest, scheduleFeedDigestSlice,
-		realtimeFeedName,
-		db,
-		logger,
-	} = cfg
+const createMatchAlert = (cfg: MatchConfig) => {
+	const { scheduleFeedDigest, logger } = cfg
 
 	// Note: This function mutates `alert`.
-	const matchAlert = async (alert, opt = {}) => {
-		const {
-			realtimeFeedName,
-		} = {
+	const matchAlert = (alert: Alert, opt: MatchOptions = {}): Promise<void> => {
+		const { realtimeFeedName } = {
 			realtimeFeedName: null,
 			...opt,
 		}
@@ -116,10 +101,14 @@ const createMatchAlert = (cfg) => {
 			realtimeFeedName,
 		}
 
-		for (let entitiesIdx = 0; entitiesIdx < alert.informed_entity.length; entitiesIdx++) {
+		for (
+			let entitiesIdx = 0;
+			entitiesIdx < alert.informed_entity.length;
+			entitiesIdx++
+		) {
 			const entitySelector = alert.informed_entity[entitiesIdx]
 
-			const logCtx = {
+			const logCtx: Record<string, unknown> = {
 				..._logCtx,
 				entitiesIdx,
 				entitySelector,
@@ -129,29 +118,32 @@ const createMatchAlert = (cfg) => {
 			}
 
 			if (!entitySelector.trip) {
-				logger.trace(logCtx, `skipping EntitySelector because it doesn't have a trip`)
+				logger.trace(
+					logCtx,
+					`skipping EntitySelector because it doesn't have a trip`,
+				)
 				continue
 			}
 			const tripDescriptor = entitySelector.trip
 
 			// todo: DRY with matchTripUpdate & matchVehiclePosition
 
-			const {
-				route_id,
-				trip_id: realtimeTripId,
-			} = tripDescriptor
+			const { route_id, trip_id: realtimeTripId } = tripDescriptor
 			// const nyctTripDescriptor = tripDescriptor['.nyct_trip_descriptor'] || null
 
 			logCtx.routeId = route_id
 			logCtx.realtimeTripId = realtimeTripId
-			logger.trace({
-				...logCtx,
-				alert,
-			}, 'matching TripDescriptor in Alert')
+			logger.trace(
+				{
+					...logCtx,
+					alert,
+				},
+				'matching TripDescriptor in Alert',
+			)
 
 			// Note: We assume that the Alert informs the current (as in today's) trip "instance".
 			// todo: Is this assumption correct? What about midnight?
-			const start_date = [
+			const _start_date = [
 				// todo
 			].join('')
 			// // todo: what if there are >1 matches? the match should be unambiguous, right?
@@ -202,6 +194,7 @@ const createMatchAlert = (cfg) => {
 		}
 
 		// todo: if header_txt.translation[].text === 'Train delayed', set effect to SIGNIFICANT_DELAYS?
+		return Promise.resolve()
 	}
 
 	return {
@@ -209,6 +202,4 @@ const createMatchAlert = (cfg) => {
 	}
 }
 
-export {
-	createMatchAlert,
-}
+export { createMatchAlert }
