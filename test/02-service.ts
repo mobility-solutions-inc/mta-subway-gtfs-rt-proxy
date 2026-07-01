@@ -377,7 +377,7 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	setRealtimeFeed(encodeFeedMessage(feedMessage0))
 
 	// todo: pass in `now`?
-	const pServiceProcess = execa(PATH_TO_SERVICE, [], {
+	const pServiceProcess = execa(process.execPath, [PATH_TO_SERVICE], {
 		stdio: 'inherit',
 		env: {
 			...process.env,
