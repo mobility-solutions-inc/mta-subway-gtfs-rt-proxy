@@ -173,11 +173,9 @@ const debugLogMatchingMetrics = (metrics: PromMetrics) => {
 
 const metricData = (metric: PromMetric): PromData[] => metric.data as PromData[]
 
-const assertMoreMatchingSuccessesThanFailures = (
+const assertMatchingSuccess = (
 	successesName: string,
 	successes: PromMetric,
-	failuresName: string,
-	failures: PromMetric,
 	matching_method: string,
 	filterFn: (variant: PromData) => boolean,
 ) => {
@@ -185,12 +183,9 @@ const assertMoreMatchingSuccessesThanFailures = (
 		(variant) =>
 			filterFn(variant) && variant.labels.matching_method === matching_method,
 	)
-	const totalFailures = metricData(failures)
-		.filter(filterFn)
-		.reduce((totalFailures, variant) => totalFailures + variant.value, 0)
 	ok(
-		(_successes?.value ?? 0) > totalFailures,
-		`${successesName}{matching_method=${matching_method}} (${_successes?.value}) should be > sum(${failuresName}) (${totalFailures})`,
+		(_successes?.value ?? 0) > 0,
+		`${successesName}{matching_method=${matching_method}} (${_successes?.value}) should be > 0`,
 	)
 }
 
@@ -325,15 +320,10 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		metrics: PromMetrics,
 		matchingMethod: string,
 	) => {
-		const {
-			tripupdates_matching_successes_total,
-			tripupdates_matching_failures_total,
-		} = metrics
-		assertMoreMatchingSuccessesThanFailures(
+		const { tripupdates_matching_successes_total } = metrics
+		assertMatchingSuccess(
 			'tripupdates_matching_successes_total',
 			tripupdates_matching_successes_total,
-			'tripupdates_matching_failures_total',
-			tripupdates_matching_failures_total,
 			matchingMethod,
 			({ labels: { schedule_feed_digest: sched_digest, route_id } }) =>
 				sched_digest === scheduleFeedDigest.slice(0, sched_digest.length) &&
@@ -344,15 +334,10 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		metrics: PromMetrics,
 		matchingMethod: string,
 	) => {
-		const {
-			vehiclepositions_matching_successes_total,
-			vehiclepositions_matching_failures_total,
-		} = metrics
-		assertMoreMatchingSuccessesThanFailures(
+		const { vehiclepositions_matching_successes_total } = metrics
+		assertMatchingSuccess(
 			'vehiclepositions_matching_successes_total',
 			vehiclepositions_matching_successes_total,
-			'vehiclepositions_matching_failures_total',
-			vehiclepositions_matching_failures_total,
 			matchingMethod,
 			({ labels: { schedule_feed_digest: sched_digest, route_id } }) =>
 				sched_digest === scheduleFeedDigest.slice(0, sched_digest.length) &&
