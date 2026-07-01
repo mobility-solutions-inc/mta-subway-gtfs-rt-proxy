@@ -62,7 +62,7 @@
 	},
 	"scripts": {
 		"test": "./test/index.sh",
-		"lint": "eslint --cache --cache-location .cache/.eslintcache",
+		"lint": "pnpm run build:proto && eslint --cache --cache-location .cache/.eslintcache",
 		"format": "prettier --check . --ignore-path .prettierignore --ignore-path .gitignore --cache --cache-location .cache/.prettiercache",
 		"format:fix": "prettier --write . --ignore-path .prettierignore --ignore-path .gitignore",
 		"build:proto": "./build.sh",
