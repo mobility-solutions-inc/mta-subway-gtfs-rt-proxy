@@ -4,7 +4,8 @@
 [submodule "google-transit"]
 	path = google-transit
 	url = https://github.com/google/transit.git
+	branch = master
 [submodule "postgis-gtfs-importer"]
 	path = postgis-gtfs-importer
 	url = https://github.com/mobidata-bw/postgis-gtfs-importer.git
-	branch = v5
+	branch = v7

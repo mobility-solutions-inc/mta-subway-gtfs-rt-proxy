@@ -1,21 +1,35 @@
-import {ok} from 'node:assert'
-// protobuf.js (used to build the GTFS-Realtime bindings in this project) parses GTFS-Realtime's (u)int64 into its own bespoke `Long` repesentation.
-// see also https://github.com/protobufjs/protobuf.js/issues/1151
-// see also https://github.com/dcodeIO/long.js/issues/82#issuecomment-1163021226
-import {toBigInt as protobufJsLongToBigInt} from 'longfn'
-import {Gauge, Summary} from 'prom-client'
-import pgFormat from 'pg-format'
+import { ok } from 'node:assert'
 import countBy from 'lodash/countBy.js'
+import pgFormat from 'pg-format'
+import { Gauge, Summary } from 'prom-client'
+
+import type {
+	FeedHeader,
+	FeedMessage,
+	MatchConfig,
+	MatchOptions,
+} from './types.js'
+import { register as metricsRegister } from './metrics.js'
 import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
-import {register as metricsRegister} from './metrics.js'
+import { protobufLongToNumber } from './protobuf.js'
 
-const {ScheduleRelationship} = gtfsRtBindings.transit_realtime.TripDescriptor
+const { ScheduleRelationship } = gtfsRtBindings.transit_realtime.TripDescriptor
 
-const parseTripReplacementPeriods = (cfg, feedHeader) => {
-	const {
-		logger,
-		logCtx,
-	} = cfg
+interface ParseTripReplacementPeriodsConfig {
+	logger: MatchConfig['logger']
+	logCtx: Record<string, unknown>
+}
+
+interface ParsedTripReplacementPeriod {
+	end: number
+	start: number
+}
+
+const parseTripReplacementPeriods = (
+	cfg: ParseTripReplacementPeriodsConfig,
+	feedHeader: FeedHeader,
+) => {
+	const { logger, logCtx } = cfg
 
 	const feedTimestamp = feedHeader.timestamp
 	ok(feedTimestamp, 'missing FeedMessage.header.timestamp')
@@ -26,26 +40,32 @@ const parseTripReplacementPeriods = (cfg, feedHeader) => {
 		return null
 	}
 
-	// route_id -> {start: BigInt, end: BigInt}
-	const byRouteId = new Map()
+	// route_id -> {start, end}
+	const byRouteId = new Map<string, ParsedTripReplacementPeriod>()
 
 	for (const tripReplacementPeriod of tripReplacementPeriods) {
-		const {route_id} = tripReplacementPeriod
+		const { route_id } = tripReplacementPeriod
 		if (!route_id) {
 			// todo: add metric?
-			logger.warn({
-				...logCtx,
-				tripReplacementPeriod,
-			}, 'cannot handle TripReplacementPeriod without route_id')
+			logger.warn(
+				{
+					...logCtx,
+					tripReplacementPeriod,
+				},
+				'cannot handle TripReplacementPeriod without route_id',
+			)
 			continue
 		}
 		const replPeriod = tripReplacementPeriod.replacement_period
 		if (!replPeriod) {
 			// todo: add metric?
-			logger.warn({
-				...logCtx,
-				tripReplacementPeriod,
-			}, 'cannot handle TripReplacementPeriod without replacement_period')
+			logger.warn(
+				{
+					...logCtx,
+					tripReplacementPeriod,
+				},
+				'cannot handle TripReplacementPeriod without replacement_period',
+			)
 			continue
 		}
 
@@ -54,28 +74,16 @@ const parseTripReplacementPeriods = (cfg, feedHeader) => {
 		// > The start time is omitted, the end time is currently now + 30 minutes for all routes of the A division.
 		// https://api.mta.info/GTFS.pdf
 		// Both start & end are UNIX timestamps, so we can safely convert them into a number for the time being.
-		const defaultStart = parseInt(String(
-			typeof feedTimestamp === 'bigint'
-				? feedTimestamp
-				: protobufJsLongToBigInt(feedTimestamp)
-		), 10)
+		const defaultStart = protobufLongToNumber(feedTimestamp)
 		const defaultEnd = defaultStart + 30 * 60 // 30 minutes from now
 		const start = replPeriod.start
-			? parseInt(String(
-				typeof replPeriod.start === 'bigint'
-					? replPeriod.start
-					: protobufJsLongToBigInt(replPeriod.start),
-			))
+			? protobufLongToNumber(replPeriod.start)
 			: defaultStart
 		const end = replPeriod.end
-			? parseInt(String(
-				typeof replPeriod.end === 'bigint'
-					? replPeriod.end
-					: protobufJsLongToBigInt(replPeriod.end),
-			))
+			? protobufLongToNumber(replPeriod.end)
 			: defaultEnd
 
-		byRouteId.set(route_id, {start, end})
+		byRouteId.set(route_id, { start, end })
 	}
 
 	return byRouteId
@@ -85,18 +93,13 @@ const _queryTripReplPeriodsTimeSeconds = new Summary({
 	name: 'tripreplacementperiods_query_time_seconds',
 	help: 'time needed to fetch all trips covered by the TripReplacementPeriods',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-	],
+	labelNames: ['schedule_feed_digest'],
 })
 const _tripReplPeriodsCanceledTripUpdatesTotal = new Gauge({
 	name: 'tripreplperiods_no_of_canceled_trip_updates_total',
 	help: 'number of TripUpdates added because of a TripReplacementPeriod',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id'],
 })
 // const _tripReplPeriodsCanceledVehiclePositionsTotal = new Gauge({
 // 	name: 'tripreplperiods_no_of_canceled_vehicle_positions_total',
@@ -105,37 +108,53 @@ const _tripReplPeriodsCanceledTripUpdatesTotal = new Gauge({
 // 	labelNames: ['route_id'],
 // })
 
-const createApplyTripReplacementPeriods = (cfg) => {
-	const {
-		scheduleFeedDigest, scheduleFeedDigestSlice,
-		db,
-		logger,
-	} = cfg
-	const applyTripReplacementPeriods = async (feedMessage, realtimeFeedName) => {
+interface CanceledTripRow {
+	route_id: string
+	start_date: string
+	start_time: string
+	trip_id: string
+}
+
+const createApplyTripReplacementPeriods = (cfg: MatchConfig) => {
+	const { scheduleFeedDigest, scheduleFeedDigestSlice, db, logger } = cfg
+	const applyTripReplacementPeriods = async (
+		feedMessage: FeedMessage,
+		opt: MatchOptions = {},
+	) => {
+		const { realtimeFeedName } = {
+			realtimeFeedName: null,
+			...opt,
+		}
 		const logCtx = {
 			scheduleFeedDigest,
 			realtimeFeedName,
 		}
 
 		// Because it is a UNIX timestamp, it can be safely converted into a number for the time being.
-		const {timestamp: _ts} = feedMessage.header
+		const { timestamp: _ts } = feedMessage.header
 		ok(_ts, 'missing FeedMessage.header.timestamp')
-		const tRef = parseInt(String(
-			typeof _ts === 'bigint' ? _ts : protobufJsLongToBigInt(_ts),
-		), 10)
+		const tRef = protobufLongToNumber(_ts)
 
-		const allTripIds = Array.from(new Set(
-			feedMessage.entity
-			.flatMap(entity => [
-				entity.trip_update?.trip?.trip_id,
-				entity.vehicle?.trip?.trip_id,
-			])
-			.filter(item => !!item)
-		))
-		logger.trace({
-			...logCtx,
-			allTripIds,
-		}, 'not replacing trip IDs already present in the feed')
+		const allTripIds = Array.from(
+			new Set<string>(
+				feedMessage.entity
+					.flatMap((entity) => [
+						entity.trip_update?.trip?.trip_id,
+						entity.vehicle?.trip?.trip_id,
+					])
+					.filter(
+						(item): item is string =>
+							typeof item === 'string' && item.length > 0,
+					),
+			),
+		)
+		logger.trace(
+			{
+				...logCtx,
+				allTripIds,
+			},
+			'not replacing trip IDs already present in the feed',
+		)
 
 		let queryTpl = `\
 	SELECT DISTINCT ON (ad.route_id, ad.trip_id, "date")
@@ -151,21 +170,25 @@ const createApplyTripReplacementPeriods = (cfg) => {
 	AND (
 		False
 	`
-		const queryTplValues = []
-		const queryArguments = [
-			Array.from(allTripIds),
-		]
+		const queryTplValues: (number | string)[] = []
+		const queryArguments: (number | string[])[] = [Array.from(allTripIds)]
 
-		const tripReplacementPeriods = parseTripReplacementPeriods({
-			logger,
-			logCtx,
-		}, feedMessage.header)
+		const tripReplacementPeriods = parseTripReplacementPeriods(
+			{
+				logger,
+				logCtx,
+			},
+			feedMessage.header,
+		)
 		if (tripReplacementPeriods === null) {
-			logger.debug({
-				...logCtx,
-				feedMessage,
-			}, 'could not parse TripReplacementPeriods, skipping FeedMessage')
-			return;
+			logger.debug(
+				{
+					...logCtx,
+					feedMessage,
+				},
+				'could not parse TripReplacementPeriods, skipping FeedMessage',
+			)
+			return
 		}
 
 		for (const [route_id, replPeriod] of tripReplacementPeriods) {
@@ -177,18 +200,23 @@ const createApplyTripReplacementPeriods = (cfg) => {
 			// > TripReplacementPeriod
 			// > replacement_period – The start time is omitted, the end time is currently now + 30 minutes for all routes of the A division. See transit_realtime.TimeRange.
 			// todo: Given the MTA's realtime feed usually only explicitly specifies the status of *current* trip "instances", if we were to use -infinity as the start, *all* not-explicitly-enumerated ones (e.g. those a week ago) would be considered cancelled. Surely this is not the intention. 🤔
-			const start = 'start' in replPeriod && replPeriod.start > 0
-				? replPeriod.start
-				: tRef - 30 * 60 // 30 minutes ago
-			const end = 'end' in replPeriod && replPeriod.end > 0
-				? replPeriod.end
-				: tRef + 30 * 60 // 30 minutes ago
-			logger.trace({
-				...logCtx,
-				route_id,
-				start,
-				end,
-			}, 'applying TripReplacementPeriod') // todo: trace-log?
+			const start =
+				'start' in replPeriod && replPeriod.start > 0
+					? replPeriod.start
+					: tRef - 30 * 60 // 30 minutes ago
+			const end =
+				'end' in replPeriod && replPeriod.end > 0
+					? replPeriod.end
+					: tRef + 30 * 60 // 30 minutes ago
+			logger.trace(
+				{
+					...logCtx,
+					route_id,
+					start,
+					end,
+				},
+				'applying TripReplacementPeriod',
+			) // todo: trace-log?
 
 			// Note: We assume that the *entire trip is affected* (cancelled if it does’t have an entry in the realtime feed) as soon as any part of it is within the TripReplacementPeriod's TimeRange.
 			queryTpl += `\
@@ -202,11 +230,7 @@ const createApplyTripReplacementPeriods = (cfg) => {
 			AND "date" <= dates_filter_max(to_timestamp(%L::int))
 		)
 	`
-			queryTplValues.push(
-				route_id,
-				start, end,
-				start, end,
-			)
+			queryTplValues.push(route_id, start, end, start, end)
 		}
 
 		queryTpl += `\
@@ -218,55 +242,67 @@ const createApplyTripReplacementPeriods = (cfg) => {
 		queryArguments.push(limit)
 
 		const t0 = performance.now()
-		const {rows: canceled} = await db.query({
+		const { rows: canceled } = await db.query<CanceledTripRow>({
 			text: pgFormat(queryTpl, ...queryTplValues),
 			values: queryArguments,
 		})
 		const queryTime = (performance.now() - t0) / 1000
-		_queryTripReplPeriodsTimeSeconds.observe({
-			schedule_feed_digest: scheduleFeedDigestSlice,
-		}, queryTime)
-		logger.debug({
-			...logCtx,
+		_queryTripReplPeriodsTimeSeconds.observe(
+			{
+				schedule_feed_digest: scheduleFeedDigestSlice,
+			},
 			queryTime,
-		}, 'queried TripReplacementPeriods')
+		)
+		logger.debug(
+			{
+				...logCtx,
+				queryTime,
+			},
+			'queried TripReplacementPeriods',
+		)
 
 		if (canceled.length >= limit) {
-			logger.warn(logCtx, `TripReplacementPeriods query returned ${limit} results, not applying them`)
-			return;
+			logger.warn(
+				logCtx,
+				`TripReplacementPeriods query returned ${limit} results, not applying them`,
+			)
+			return
 		}
 
-		const counts = Object.entries(countBy(canceled, ({route_id}) => route_id))
+		const counts = Object.entries(countBy(canceled, ({ route_id }) => route_id))
 		for (const [route_id, count] of counts) {
-			_tripReplPeriodsCanceledTripUpdatesTotal.set({
-				schedule_feed_digest: scheduleFeedDigestSlice,
-				route_id,
-			}, count)
+			_tripReplPeriodsCanceledTripUpdatesTotal.set(
+				{
+					schedule_feed_digest: scheduleFeedDigestSlice,
+					route_id,
+				},
+				count,
+			)
 		}
 
 		// todo: generate VehiclePositions?
-		const canceledFeedEntities = canceled.map(({trip_id, route_id, start_date, start_time}) => {
-			// start_date has been cast to ISO 8601 in the query above, so we can directly remove the `-`.
-			start_date = start_date.replace(/-/g, '')
-			return {
-				id: `canceled-${start_date}-${trip_id}`,
-				trip_update: {
-					trip: {
-						trip_id,
-						route_id,
-						start_date,
-						start_time,
-						schedule_relationship: ScheduleRelationship.CANCELED,
+		const canceledFeedEntities = canceled.map(
+			({ trip_id, route_id, start_date, start_time }) => {
+				// start_date has been cast to ISO 8601 in the query above, so we can directly remove the `-`.
+				start_date = start_date.replace(/-/g, '')
+				return {
+					id: `canceled-${start_date}-${trip_id}`,
+					trip_update: {
+						trip: {
+							trip_id,
+							route_id,
+							start_date,
+							start_time,
+							schedule_relationship: ScheduleRelationship.CANCELED,
+						},
 					},
-				},
-			}
-		})
+				}
+			},
+		)
 		feedMessage.entity.unshift(...canceledFeedEntities)
 	}
 
 	return applyTripReplacementPeriods
 }
 
-export {
-	createApplyTripReplacementPeriods,
-}
+export { createApplyTripReplacementPeriods }

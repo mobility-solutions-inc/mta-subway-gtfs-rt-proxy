@@ -1,10 +1,20 @@
 import groupBy from 'lodash/groupBy.js'
-import {toBigInt as _protobufJsLongToBigInt} from 'longfn'
-import {Summary, Gauge} from 'prom-client'
-import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
-import {register as metricsRegister} from './metrics.js'
+import { Gauge, Summary } from 'prom-client'
 
-const {ScheduleRelationship} = gtfsRtBindings.transit_realtime.TripDescriptor
+import type {
+	FeedMessage,
+	MatchConfig,
+	MatchOptions,
+	PreviousStopTimeUpdate,
+	ProtobufLong,
+	StopTimeEvent,
+	StopTimeUpdate,
+} from './types.js'
+import { register as metricsRegister } from './metrics.js'
+import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
+import { protobufLongToBigInt } from './protobuf.js'
+
+const { ScheduleRelationship } = gtfsRtBindings.transit_realtime.TripDescriptor
 
 const MAX_AGE = process.env.STOP_TIME_UPDATES_MAX_AGE_SECONDS
 	? parseInt(process.env.STOP_TIME_UPDATES_MAX_AGE_SECONDS)
@@ -13,33 +23,33 @@ const CLEAN_INTERVAL = process.env.STOP_TIME_UPDATES_CLEAN_INTERVAL_SECONDS
 	? parseInt(process.env.STOP_TIME_UPDATES_CLEAN_INTERVAL_SECONDS)
 	: 1 * 60 * 60 // 1h
 
-// protobuf.js (used to build the GTFS-Realtime bindings in this project) parses GTFS-Realtime's (u)int64 into its own bespoke `Long` repesentation.
-// see also https://github.com/protobufjs/protobuf.js/issues/1151
-// see also https://github.com/dcodeIO/long.js/issues/82#issuecomment-1163021226
-const protobufJsLongToBigInt = (val) => {
-	if (typeof val === 'bigint') return val
-	return _protobufJsLongToBigInt(val)
-}
-
-const _restoreStopTimeEvent = (field, sTU, timestamp, prevSTU) => {
+const _restoreStopTimeEvent = (
+	field: 'arrival' | 'departure',
+	sTU: StopTimeUpdate,
+	timestamp: ProtobufLong,
+	prevSTU: PreviousStopTimeUpdate,
+) => {
 	// todo: think about this logic again! what about {arrival,departure}.delay?
+	const previousTime = prevSTU[`${field}_time`]
 
 	if (
-		prevSTU[`${field}_time`] !== null
-		&& (
-			!sTU[field]?.time
-			|| timestamp < prevSTU.timestamp
-		)
+		previousTime !== null &&
+		(!sTU[field]?.time ||
+			protobufLongToBigInt(timestamp) < protobufLongToBigInt(prevSTU.timestamp))
 	) {
 		// todo: trace-log
 		// todo: add .uncertainty based on how old the measurement is?
 		// todo: what about .delay? based on schedule?
 		sTU[field] = {
-			time: BigInt(prevSTU[`${field}_time`]),
-		}
+			time: BigInt(previousTime),
+		} satisfies StopTimeEvent
 	}
 }
-const _restoreStopTimeUpdate = (sTU, timestamp, prevSTU) => {
+const _restoreStopTimeUpdate = (
+	sTU: StopTimeUpdate,
+	timestamp: ProtobufLong,
+	prevSTU: PreviousStopTimeUpdate,
+) => {
 	_restoreStopTimeEvent('arrival', sTU, timestamp, prevSTU)
 	_restoreStopTimeEvent('departure', sTU, timestamp, prevSTU)
 }
@@ -48,40 +58,33 @@ const storeQueryTimeSeconds = new Summary({
 	name: 'previous_stoptimeupdates_store_query_time_seconds',
 	help: 'time needed to write all StopTimeUpdates seen in the current Realtime feed into the DB',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-	],
+	labelNames: ['schedule_feed_digest'],
 })
 
 const restoreQueryTimeSeconds = new Summary({
 	name: 'previous_stoptimeupdates_restore_query_time_seconds',
 	help: 'time needed to query all previously seen StopTimeUpdates matching the current Realtime feed from the DB',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-	],
+	labelNames: ['schedule_feed_digest'],
 })
 
 const cleanQueryTimeSeconds = new Summary({
 	name: 'previous_stoptimeupdates_clean_query_time_seconds',
 	help: 'time needed to delete old/obsolete previously seen StopTimeUpdates from the DB',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-	],
+	labelNames: ['schedule_feed_digest'],
 })
 const noCleaned = new Gauge({
 	name: 'previous_stoptimeupdates_cleaned_total',
 	help: 'number of old/obsolete previously seen StopTimeUpdates cleaned from the DB during the last cleanup',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-	],
+	labelNames: ['schedule_feed_digest'],
 })
 
-const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
+const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg: MatchConfig) => {
 	const {
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		db,
 		logger,
 		// todo: expect realtimeFeedName, add to logCtx
@@ -91,10 +94,11 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 		scheduleFeedDigest,
 	}
 
-	const storeStopTimeUpdatesInDb = async (feedMessage, opt = {}) => {
-		const {
-			realtimeFeedName,
-		} = {
+	const storeStopTimeUpdatesInDb = async (
+		feedMessage: FeedMessage,
+		opt: MatchOptions = {},
+	) => {
+		const { realtimeFeedName } = {
 			realtimeFeedName: null,
 			...opt,
 		}
@@ -104,76 +108,92 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 			realtimeFeedName,
 		}
 
-		const feedTimestamp = protobufJsLongToBigInt(feedMessage.header.timestamp)
+		const headerTimestamp = feedMessage.header.timestamp
+		if (headerTimestamp === undefined || headerTimestamp === null) {
+			throw new Error('missing FeedMessage.header.timestamp')
+		}
+		const feedTimestamp = protobufLongToBigInt(headerTimestamp)
 
-		const trip_ids = []
-		const start_dates = []
-		const stop_ids = []
-		const timestamps = []
-		const arrival_times = []
-		const arrival_delays = []
-		const departure_times = []
-		const departure_delays = []
+		const trip_ids: string[] = []
+		const start_dates: string[] = []
+		const stop_ids: string[] = []
+		const timestamps: bigint[] = []
+		const arrival_times: (bigint | null)[] = []
+		const arrival_delays: (bigint | null)[] = []
+		const departure_times: (bigint | null)[] = []
+		const departure_delays: (bigint | null)[] = []
 		for (const feedEntity of feedMessage.entity) {
 			// Restoring – and therefore storing – StopTimeUpdates only really makes sense for TripUpdates.
 			if (!feedEntity.trip_update) continue
 			const tripUpdate = feedEntity.trip_update
 
 			if (!tripUpdate.stop_time_update) {
-				const {schedule_relationship} = tripUpdate.trip
-				if (schedule_relationship && schedule_relationship !== ScheduleRelationship.SCHEDULED) {
-					logger.warn({
-						...logCtx,
-						tripUpdate,
-					}, 'TripUpdate without stop_time_update[] even though its schedule_relationship is SCHEDULED, skipping storing')
+				const { schedule_relationship } = tripUpdate.trip
+				if (
+					schedule_relationship !== undefined &&
+					schedule_relationship !== null &&
+					schedule_relationship !== ScheduleRelationship.SCHEDULED
+				) {
+					logger.warn(
+						{
+							...logCtx,
+							tripUpdate,
+						},
+						'TripUpdate without stop_time_update[] even though its schedule_relationship is SCHEDULED, skipping storing',
+					)
 				} else {
-					logger.debug({
-						...logCtx,
-						tripUpdate,
-					}, 'TripUpdate without stop_time_update[], skipping storing')
+					logger.debug(
+						{
+							...logCtx,
+							tripUpdate,
+						},
+						'TripUpdate without stop_time_update[], skipping storing',
+					)
 				}
 				continue
 			}
 
 			for (const stopTimeUpdate of tripUpdate.stop_time_update) {
 				if (
-					!tripUpdate.trip?.trip_id
-					|| !tripUpdate.trip?.start_date
-					|| !stopTimeUpdate.stop_id
-				) continue // todo: log?
+					!tripUpdate.trip?.trip_id ||
+					!tripUpdate.trip?.start_date ||
+					!stopTimeUpdate.stop_id
+				)
+					continue // todo: log?
 
 				trip_ids.push(tripUpdate.trip.trip_id)
 				start_dates.push(tripUpdate.trip.start_date)
 				stop_ids.push(stopTimeUpdate.stop_id)
-				timestamps.push(tripUpdate.timestamp
-					&& protobufJsLongToBigInt(tripUpdate.timestamp)
-					|| feedTimestamp
+				timestamps.push(
+					tripUpdate.timestamp
+						? protobufLongToBigInt(tripUpdate.timestamp)
+						: feedTimestamp,
 				)
 
 				// We prefer {arrival,departure}_time over {arrival,departure}_delay.
 				const arrival_time = stopTimeUpdate.arrival?.time
-					&& protobufJsLongToBigInt(stopTimeUpdate.arrival.time)
-					|| null
+					? protobufLongToBigInt(stopTimeUpdate.arrival.time)
+					: null
 				arrival_times.push(arrival_time)
 				const departure_time = stopTimeUpdate.departure?.time
-					&& protobufJsLongToBigInt(stopTimeUpdate.departure.time)
-					|| null
-				arrival_delays.push(arrival_time === null
-					? (
-						stopTimeUpdate.arrival?.delay
-							&& protobufJsLongToBigInt(stopTimeUpdate.arrival.delay)
-							|| null
-					)
+					? protobufLongToBigInt(stopTimeUpdate.departure.time)
 					: null
+				const arrivalDelay = stopTimeUpdate.arrival?.delay ?? null
+				arrival_delays.push(
+					arrival_time === null
+						? arrivalDelay === null
+							? null
+							: BigInt(arrivalDelay)
+						: null,
 				)
 				departure_times.push(departure_time)
-				departure_delays.push(departure_time === null
-					? (
-						stopTimeUpdate.departure?.delay
-							&& protobufJsLongToBigInt(stopTimeUpdate.departure.delay)
-							|| null
-					)
-					: null
+				const departureDelay = stopTimeUpdate.departure?.delay ?? null
+				departure_delays.push(
+					departure_time === null
+						? departureDelay === null
+							? null
+							: BigInt(departureDelay)
+						: null,
 				)
 			}
 		}
@@ -181,7 +201,8 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 
 		const t0 = performance.now()
 		// https://github.com/brianc/node-postgres/issues/957#issuecomment-295583050
-		await db.query(`\
+		await db.query(
+			`\
 			INSERT INTO previous_stoptimeupdates (
 				trip_id, start_date, stop_id,
 				"timestamp",
@@ -204,32 +225,41 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 					departure_time = excluded.departure_time,
 					departure_delay = excluded.departure_delay
 				WHERE excluded."timestamp" >= previous_stoptimeupdates."timestamp";
-		`, [
-			trip_ids,
-			start_dates,
-			stop_ids,
-			timestamps,
-			arrival_times,
-			arrival_delays,
-			departure_times,
-			departure_delays,
-		])
+		`,
+			[
+				trip_ids,
+				start_dates,
+				stop_ids,
+				timestamps,
+				arrival_times,
+				arrival_delays,
+				departure_times,
+				departure_delays,
+			],
+		)
 		const queryTime = (performance.now() - t0) / 1000
-		storeQueryTimeSeconds.observe({
-			schedule_feed_digest: scheduleFeedDigestSlice,
-		}, queryTime)
-		logger.debug({
-			...logCtx,
+		storeQueryTimeSeconds.observe(
+			{
+				schedule_feed_digest: scheduleFeedDigestSlice,
+			},
 			queryTime,
-			nrOfStopTimeUpdates,
-		}, 'queried TripReplacementPeriods')
+		)
+		logger.debug(
+			{
+				...logCtx,
+				queryTime,
+				nrOfStopTimeUpdates,
+			},
+			'queried TripReplacementPeriods',
+		)
 		// todo: add metric for number of newly stored StopTimeUpdates?
 	}
 
-	const restoreStopTimeUpdatesFromDb = async (feedMessage, opt = {}) => {
-		const {
-			realtimeFeedName,
-		} = {
+	const restoreStopTimeUpdatesFromDb = async (
+		feedMessage: FeedMessage,
+		opt: MatchOptions = {},
+	) => {
+		const { realtimeFeedName } = {
 			realtimeFeedName: null,
 			...opt,
 		}
@@ -251,12 +281,15 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 			FROM previous_stoptimeupdates
 			WHERE False -- "OR"s follow
 `
-		const values = []
-		let valuesI = 1, nrOfTrips = 0
+		const values: string[] = []
+		let valuesI = 1,
+			nrOfTrips = 0
 		for (const feedEntity of feedMessage.entity) {
 			// Restoring – and therefore storing – StopTimeUpdates only really makes sense for TripUpdates.
 			if (!feedEntity.trip_update) continue
 			const tripUpdate = feedEntity.trip_update
+			const { start_date: startDate, trip_id: tripId } = tripUpdate.trip
+			if (!startDate || !tripId) continue
 
 			query += `\
 				OR (trip_id = $${valuesI++} AND start_date = $${valuesI++})
@@ -264,14 +297,11 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 
 			// convert to ISO 8601 (PostgreSQL-compatible)
 			const isoStartDate = [
-				tripUpdate.trip.start_date.substr(0, 4),
-				tripUpdate.trip.start_date.substr(4, 2),
-				tripUpdate.trip.start_date.substr(6, 2),
+				startDate.slice(0, 4),
+				startDate.slice(4, 6),
+				startDate.slice(6, 8),
 			].join('-')
-			values.push(
-				tripUpdate.trip.trip_id,
-				isoStartDate,
-			)
+			values.push(tripId, isoStartDate)
 			nrOfTrips++
 		}
 		query += `\
@@ -279,32 +309,38 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 `
 
 		const t0 = performance.now()
-		const {
-			rows: _previousStopTimeUpdates,
-		} = await db.query(query, values)
+		const { rows: _previousStopTimeUpdates } =
+			await db.query<PreviousStopTimeUpdate>(query, values)
 		const queryTime = (performance.now() - t0) / 1000
-		restoreQueryTimeSeconds.observe({
-			schedule_feed_digest: scheduleFeedDigestSlice,
-		}, queryTime)
-		logger.debug({
-			...logCtx,
+		restoreQueryTimeSeconds.observe(
+			{
+				schedule_feed_digest: scheduleFeedDigestSlice,
+			},
 			queryTime,
-			nrOfTrips,
-			nrOfStopTimeUpdates: _previousStopTimeUpdates.length,
-		}, 'queried TripReplacementPeriods')
+		)
+		logger.debug(
+			{
+				...logCtx,
+				queryTime,
+				nrOfTrips,
+				nrOfStopTimeUpdates: _previousStopTimeUpdates.length,
+			},
+			'queried TripReplacementPeriods',
+		)
 
 		// use a Map to get from `n^2` to `n*log(n)` runtime
 		// trip_id:start_date -> [previousStopTimeUpdate]
 		// todo: add stop_sequence to key
-		const previousStopTimeUpdatesByTrip = new Map(Object.entries(
-			groupBy(
-				_previousStopTimeUpdates,
-				(sTU) => [
-					sTU.trip_id,
-					sTU.start_date.split('-').join(''),
-				].join(':'),
+		const previousStopTimeUpdatesByTrip = new Map<
+			string,
+			PreviousStopTimeUpdate[]
+		>(
+			Object.entries(
+				groupBy(_previousStopTimeUpdates, (sTU) =>
+					[sTU.trip_id, sTU.start_date.split('-').join('')].join(':'),
+				),
 			),
-		))
+		)
 
 		// todo: add metric for ratio of trips with >=1 restored STU?
 		for (const feedEntity of feedMessage.entity) {
@@ -312,11 +348,7 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 			if (!feedEntity.trip_update) continue
 			const tripUpdate = feedEntity.trip_update
 
-			const {
-				route_id,
-				trip_id,
-				start_date,
-			} = tripUpdate.trip
+			const { route_id, trip_id, start_date } = tripUpdate.trip
 			const _logCtx = {
 				...logCtx,
 				route_id,
@@ -330,16 +362,29 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 				continue
 			}
 			const previousStopTimeUpdates = previousStopTimeUpdatesByTrip.get(mapKey)
+			if (!previousStopTimeUpdates) {
+				continue
+			}
 
 			const timestamp = tripUpdate.timestamp ?? feedMessage.header.timestamp
+			if (timestamp === undefined || timestamp === null) {
+				throw new Error('missing timestamp to restore StopTimeUpdates')
+			}
 
 			if (!tripUpdate.stop_time_update) {
-				const {schedule_relationship} = tripUpdate.trip
-				if (schedule_relationship && schedule_relationship !== ScheduleRelationship.SCHEDULED) {
-					logger.warn({
-						...logCtx,
-						tripUpdate,
-					}, 'TripUpdate without stop_time_update[] even though its schedule_relationship is SCHEDULED, skipping restoring')
+				const { schedule_relationship } = tripUpdate.trip
+				if (
+					schedule_relationship !== undefined &&
+					schedule_relationship !== null &&
+					schedule_relationship !== ScheduleRelationship.SCHEDULED
+				) {
+					logger.warn(
+						{
+							...logCtx,
+							tripUpdate,
+						},
+						'TripUpdate without stop_time_update[] even though its schedule_relationship is SCHEDULED, skipping restoring',
+					)
 					continue
 				}
 
@@ -350,21 +395,29 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 						stop_id,
 						// todo: (also?) use stop_sequence to compare
 					} = stopTimeUpdate
-					const previousStopTimeUpdate = previousStopTimeUpdates
-					.find(({stop_id: scheduleStopId}) => scheduleStopId === stop_id)
+					const previousStopTimeUpdate = previousStopTimeUpdates.find(
+						({ stop_id: scheduleStopId }) => scheduleStopId === stop_id,
+					)
 					if (!previousStopTimeUpdate) {
 						// todo: trace-log?
 						continue
 					}
 
-					_restoreStopTimeUpdate(stopTimeUpdate, timestamp, previousStopTimeUpdate)
+					_restoreStopTimeUpdate(
+						stopTimeUpdate,
+						timestamp,
+						previousStopTimeUpdate,
+					)
 					// todo: trace-log?
 				}
 			}
 		}
 	}
 
-	const storeAndRestoreStopTimeUpdatesFromDb = async (feedMessage, opt = {}) => {
+	const storeAndRestoreStopTimeUpdatesFromDb = async (
+		feedMessage: FeedMessage,
+		opt: MatchOptions = {},
+	) => {
 		// todo: make sure restore() doesn't already mutate `feedMessage` while the store() still accesses it
 		await Promise.all([
 			restoreStopTimeUpdatesFromDb(feedMessage, opt),
@@ -373,7 +426,7 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 	}
 
 	const cleanOldStoredStopTimeUpdates = async () => {
-		const timestampMin = ((Date.now() / 1000 | 0) - MAX_AGE)
+		const timestampMin = ((Date.now() / 1000) | 0) - MAX_AGE
 		const logCtx = {
 			timestampMin,
 			..._logCtx,
@@ -381,45 +434,56 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 
 		logger.trace(logCtx, 'deleting old stored StopTimeUpdates')
 		const t0 = performance.now()
-		const {rowCount: nrOfStopTimeUpdates} = await db.query({
+		const { rowCount: nrOfStopTimeUpdates } = await db.query({
 			text: `\
 				DELETE FROM previous_stoptimeupdates
 				WHERE timestamp < $1
 `,
-			values: [
-				timestampMin,
-			],
+			values: [timestampMin],
 		})
 		const queryTime = (performance.now() - t0) / 1000
-		cleanQueryTimeSeconds.observe({
-			schedule_feed_digest: scheduleFeedDigestSlice,
-		}, queryTime)
-		noCleaned.set({
-			schedule_feed_digest: scheduleFeedDigestSlice,
-		}, nrOfStopTimeUpdates)
-		logger.debug({
-			...logCtx,
+		cleanQueryTimeSeconds.observe(
+			{
+				schedule_feed_digest: scheduleFeedDigestSlice,
+			},
 			queryTime,
-			nrOfStopTimeUpdates,
-		}, `deleted ${nrOfStopTimeUpdates} old stored StopTimeUpdates`)
+		)
+		noCleaned.set(
+			{
+				schedule_feed_digest: scheduleFeedDigestSlice,
+			},
+			nrOfStopTimeUpdates ?? 0,
+		)
+		logger.debug(
+			{
+				...logCtx,
+				queryTime,
+				nrOfStopTimeUpdates,
+			},
+			`deleted ${nrOfStopTimeUpdates} old stored StopTimeUpdates`,
+		)
 	}
 	const startCleaningOldStoredStopTimeUpdates = () => {
 		const run = async () => {
 			try {
 				await cleanOldStoredStopTimeUpdates()
 			} catch (err) {
-				logger.warn({err}, 'failed to clean old stored StopTimeUpdates')
+				logger.warn({ err }, 'failed to clean old stored StopTimeUpdates')
 			} finally {
-				timer = setTimeout(run, CLEAN_INTERVAL * 1000)
+				timer = setTimeout(() => {
+					void run()
+				}, CLEAN_INTERVAL * 1000)
 			}
 		}
 
 		// If the process crashes soon after start for some reason, no cleanup will ever run.
 		// todo: use a proper task scheduler with a back-off logic, e.g. Kubernetes CronJob [1]
 		// [1] https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/
-		let timer = setTimeout(run, 100) // todo
+		let timer: NodeJS.Timeout | null = setTimeout(() => {
+			void run()
+		}, 100) // todo
 		const stop = () => {
-			if (timer === null) return;
+			if (timer === null) return
 			clearTimeout(timer)
 			timer = null
 		}
@@ -434,7 +498,4 @@ const createStoreAndRestoreStopTimeUpdatesFromDb = (cfg) => {
 	}
 }
 
-export {
-	createStoreAndRestoreStopTimeUpdatesFromDb,
-	_restoreStopTimeUpdate,
-}
+export { createStoreAndRestoreStopTimeUpdatesFromDb, _restoreStopTimeUpdate }

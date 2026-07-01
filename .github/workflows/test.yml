@@ -15,73 +15,80 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: ['20']
+        node-version: ['24']
 
     steps:
-    - name: checkout
-      uses: actions/checkout@v4
-      with:
-        submodules: true
-    - name: setup Node v${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+      - name: setup Node v${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
 
-    - run: npm install
-    - run: cd postgis-gtfs-importer && npm install --production
+      - run: pnpm install --frozen-lockfile
+      - run: cd postgis-gtfs-importer && pnpm install --prod --ignore-workspace --no-lockfile
 
-    - run: npm run lint
+      - run: pnpm run format
+      - run: pnpm run lint
+      - run: pnpm run typecheck
 
-    - name: install prerequisites
-      # - curl, jq, unzip & wget are needed for the qsv download script below
-      # - moreutils provides sponge, which is needed by postgis-gtfs-importer & test/02-service-prepare.sh
-      run: |
-        sudo apt install -y \
-          curl \
-          jq \
-          moreutils \
-          unzip \
-          wget
-    - name: install qsv
-      # see also https://api.github.com/repos/jqnatividad/qsv/releases
-      run: |
-        set -eu -o pipefail
-        ua='mta-gtfs-rt-consolidation-service CI'
-        assets="$(curl 'https://api.github.com/repos/jqnatividad/qsv/releases/latest' -H "User-Agent: $ua" -fsSL | jq -rc '.assets')"
-        set -x
-        zip_url="$(echo "$assets" | jq -rc '.[] | [.name, .browser_download_url]' | grep -i '\blinux-musl\b' | grep "$(uname -m)" | head -n 1 | jq -rc '.[1]')"
-        wget -nv -U "$ua" -O /tmp/qsv.zip "$zip_url"
-        unzip -n -d /usr/local/bin /tmp/qsv.zip qsv
-        chmod +x /usr/local/bin/qsv
-        qsv --version
-    - name: start PostgreSQL with PostGIS
-      run: |
-        docker run -d -q \
-          -e POSTGRES_USER=$PGUSER -e POSTGRES_PASSWORD=$PGPASSWORD -e POSTGRES_DB=$PGDATABASE \
-          -p 5432:5432 postgis/postgis:14-3.4-alpine
-      env:
-        PGUSER: postgres
-        PGPASSWORD: password
-        PGDATABASE: postgres
+      - name: install prerequisites
+        # - curl, jq, unzip & wget are needed for the qsv download script below
+        # - moreutils provides sponge, which is needed by postgis-gtfs-importer & test/02-service-prepare.sh
+        run: |
+          sudo apt install -y \
+            curl \
+            jq \
+            moreutils \
+            unzip \
+            wget
+      - name: install qsv
+        # see also https://api.github.com/repos/jqnatividad/qsv/releases
+        run: |
+          set -eu -o pipefail
+          ua='mta-gtfs-rt-consolidation-service CI'
+          assets="$(curl 'https://api.github.com/repos/jqnatividad/qsv/releases/latest' -H "User-Agent: $ua" -fsSL | jq -rc '.assets')"
+          set -x
+          zip_url="$(echo "$assets" | jq -rc '.[] | [.name, .browser_download_url]' | grep -i '\blinux-musl\b' | grep "$(uname -m)" | head -n 1 | jq -rc '.[1]')"
+          wget -nv -U "$ua" -O /tmp/qsv.zip "$zip_url"
+          unzip -n -d /usr/local/bin /tmp/qsv.zip qsv
+          chmod +x /usr/local/bin/qsv
+          qsv --version
+      - name: start PostgreSQL with PostGIS
+        run: |
+          docker run -d -q \
+            -e POSTGRES_USER=$PGUSER -e POSTGRES_PASSWORD=$PGPASSWORD -e POSTGRES_DB=$PGDATABASE \
+            -p 5432:5432 postgis/postgis:14-3.4-alpine
+        env:
+          PGUSER: postgres
+          PGPASSWORD: password
+          PGDATABASE: postgres
 
-    - run: npm run build
-    - name: install curl-mirror script
-      run: |
-        set -eux -o pipefail
-        ln -s $PWD/curl-mirror.mjs /usr/local/bin/curl-mirror
-        curl-mirror --help
+      - run: pnpm run build
+      - name: install curl-mirror script
+        run: |
+          set -eux -o pipefail
+          ln -s $PWD/curl-mirror.mjs /usr/local/bin/curl-mirror
+          curl-mirror --help
 
-    - name: run tests
-      run: sleep 5 && npm test
-      env:
-        PGHOST: localhost
-        PGPORT: '5432'
-        PGUSER: postgres
-        PGPASSWORD: password
-        # more verbose service logging to be able to analyze why tests fail
-        LOG_LEVEL: trace
-        LOG_LEVEL_SERVICE: debug
-        LOG_LEVEL_TEST: trace
-        LOG_LEVEL_MATCHING: debug
-        LOG_LEVEL_SCHEDULE_DATA: debug
+      - name: run tests
+        run: sleep 5 && pnpm test
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: password
+          # more verbose service logging to be able to analyze why tests fail
+          LOG_LEVEL: trace
+          LOG_LEVEL_SERVICE: debug
+          LOG_LEVEL_TEST: trace
+          LOG_LEVEL_MATCHING: debug
+          LOG_LEVEL_SCHEDULE_DATA: debug

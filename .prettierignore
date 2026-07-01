@@ -1,0 +1,17 @@
+.cache
+dist
+node_modules
+
+google-transit
+postgis-gtfs-importer
+python-nyct-gtfs
+
+curl-mirror.mjs
+lib/gtfs-realtime.proto
+lib/mta-gtfs-realtime.proto
+lib/mta-gtfs-realtime.pb.d.ts
+lib/mta-gtfs-realtime.pb.js
+
+test/*.gtfs
+test/*.gtfs.tar.*
+test/*.gtfs.zip

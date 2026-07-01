@@ -4,7 +4,6 @@
 
 It is used to feed an [OpenTripPlanner (OTP)](https://www.opentripplanner.org) instance with realtime data.
 
-
 ## How it works
 
 ### Problems with the MTA feeds
@@ -12,8 +11,9 @@ It is used to feed an [OpenTripPlanner (OTP)](https://www.opentripplanner.org) i
 [MTA](https://en.wikipedia.org/wiki/Metropolitan_Transportation_Authority)/[NYCT](https://en.wikipedia.org/wiki/New_York_City_Transit_Authority) offers both a set of [GTFS Schedule](https://gtfs.org/schedule/) [feeds](https://new.mta.info/developers) feeds (that express the lines' schedule as planned in advance) and a set of [GTFS Realtime (GTFS-RT)](https://gtfs.org/realtime) feeds (that each contain all deviations from the respective Schedule feed).
 
 However, they deviate from the spec in two significant ways:
-1. The **Realtime feeds do not (re-)use the trip IDs from the Schedule feed** (we use the ["supplemented" Schedule feed](https://new.mta.info/developers)) but only the last part of them (or arbitrary ones in some cases). This means that consumers cannot easily determine *which* scheduled trains are canceled, delayed, etc. – The *Matching* section below describes this service's approach to this.
-2. The **Realtime feeds use a [proprietary extension](https://web.archive.org/web/20240220224602/https://api.mta.info/GTFS.pdf)** that considers *all* trains within a time frame canceled whose status is not *explicitly* specified otherwise. This means that consumers that do not support this extension will interpret the Realtime feed in a way that is at least very misleading to commuters, not showing these trips as canceled even though effectively they are. – The *Trip replacement periods* section below describes how this service transforms the MTA-proprietary format into a spec-compliant one.
+
+1. The **Realtime feeds do not (re-)use the trip IDs from the Schedule feed** (we use the ["supplemented" Schedule feed](https://new.mta.info/developers)) but only the last part of them (or arbitrary ones in some cases). This means that consumers cannot easily determine _which_ scheduled trains are canceled, delayed, etc. – The _Matching_ section below describes this service's approach to this.
+2. The **Realtime feeds use a [proprietary extension](https://web.archive.org/web/20240220224602/https://api.mta.info/GTFS.pdf)** that considers _all_ trains within a time frame canceled whose status is not _explicitly_ specified otherwise. This means that consumers that do not support this extension will interpret the Realtime feed in a way that is at least very misleading to commuters, not showing these trips as canceled even though effectively they are. – The _Trip replacement periods_ section below describes how this service transforms the MTA-proprietary format into a spec-compliant one.
 
 This service fetches the GTFS Realtime feed periodically and processes it as described below in detail, so that **consumers (e.g. [OpenTripPlanner](https://opentripplanner.org)) can process the resulting transformed feed as-is**, without MTA-specific customizations.
 
@@ -22,6 +22,7 @@ This service fetches the GTFS Realtime feed periodically and processes it as des
 MTA's GTFS Realtime API omits a `StopTimeUpdate` from a `TripUpdate` as soon as it is in the past (as in: the train/"run" has left the stop). While the specification allows this – it says that "it is possible, although inconsequential, to also provide updates for preceding stops" –, such behavior requires consumers that want to show the entire trip's state to the user to store the latest known realtime data for each `StopTimeUpdate`.
 
 On behalf of the consumers, **this service "restores" previously seen (usually past) `StopTimeUpdate`s** by, whenever the Realtime feed is processed, simultaneously:
+
 - writing all current `StopTimeUpdate`s into a database table, along with the `stop_id` and their `TripUpdate`'s `trip_id` & `start_date`, to be used in a later.
 - querying previously stored ("seen") `StopTimeUpdate`s that match the feed (again using `stop_id`, `trip_id` & `start_date`), and adding filling in the `TripUpdate`'s `StopTimeUpdate`s, so that includes even those in the past.
 
@@ -31,48 +32,48 @@ While the Realtime feed's `trip_id`s do not match with those in the Schedule fee
 
 Or put in another way: **As soon as `(realtime trip_id, route_id, start_date)` uniquely identifies a train/"run" within the Schedule data, we consider this a "match" and assign the Schedule's `trip_id` to the respective realtime entity**. This process, which we call "matching", is repeated for each realtime entity (`TripUpdate`, `VehiclePosition` or `Alert`) whenever the upstream Realtime feed is fetched from MTA (periodically).
 
-This service first imports it into a [PostgreSQL](https://www.postgresql.org) database using [`postgis-gtfs-importer`](https://github.com/mobidata-bw/postgis-gtfs-importer) and [`gtfs-via-postgres`](https://github.com/public-transport/gtfs-via-postgres), and later queries the database while *matching* the realtime data.
+This service first imports it into a [PostgreSQL](https://www.postgresql.org) database using [`postgis-gtfs-importer`](https://github.com/mobidata-bw/postgis-gtfs-importer) and [`gtfs-via-postgres`](https://github.com/public-transport/gtfs-via-postgres), and later queries the database while _matching_ the realtime data.
 
 ### 2. Trip replacement periods
 
-After the *matching* process (see above), this service also normalizes the Realtime feed's proprietary `TripReplacementPeriod`s by:
+After the _matching_ process (see above), this service also normalizes the Realtime feed's proprietary `TripReplacementPeriod`s by:
+
 1. for each `TripReplacementPeriod`, querying all trains/"runs" within its `[replacement_period.start, replacement_period.end]` time frame;
 2. for each train/"run", generating a `TripUpdate` with `trip.schedule_relationship: CANCELED`, except if the train/"run" already has an entity (usually a `TripUpdate`) in the upstream Realtime feed that explicit specifies it's status.
 
-Just like the *matching*, this process – which we call "applying the trip replacement periods" – happens whenever we fetch the upstream Realtime feed.
+Just like the _matching_, this process – which we call "applying the trip replacement periods" – happens whenever we fetch the upstream Realtime feed.
 
 ### Multiple Realtime feeds per Schedule feed
 
 With some MTA/NYCT subsystems, there are multiple Realtime feeds per Schedule Feed; For example, the Subway Schedule feed covers all lines (`A`-`G`, `J`, `L`, `M`, `N`, `Q`, `R`, `W`, `Z`, `1`-`7`, as well as `SIR`), while the Realtime feeds are split into groups (`A`/`C`/`E`, `B`/`D`/`F`/`M`, etc.).
 
-This is why the **processing steps described above happen for *each* Realtime feed**.
+This is why the **processing steps described above happen for _each_ Realtime feed**.
 
 > [!NOTE]
-> This service currently only handles the `1` Subway Schedule feed (and its corresponding `r` Realtime feeds). It *does not* process MTA's other `s` Schedule feeds (Manhattan buses, Long Island Rail Road, etc.). So there are only `1 * r` instead of `s * r` Realtime/Schedule pairs.
-> [PR #1 adds support for >1 Schedule feeds](https://github.com/cedarbaum/mta-subway-gtfs-rt-proxy/pull/1).
+> This service currently only handles the `1` Subway Schedule feed (and its corresponding `r` Realtime feeds). It _does not_ process MTA's other `s` Schedule feeds (Manhattan buses, Long Island Rail Road, etc.). So there are only `1 * r` instead of `s * r` Realtime/Schedule pairs.
+> The upstream [PR #1](https://github.com/cedarbaum/mta-subway-gtfs-rt-proxy/pull/1) adds support for >1 Schedule feeds.
 
 ### Multiple feed versions
 
 MTA/NYCT publish a new "version" of each Schedule feed from time to time, with a timing that we have no control over.
 
-Because we also *cannot* coordinate when both this service *and its consumers* switch to the latest *version*, **a period of time occurs during which this service still has the previous/old *version* while the consumer already has the latest**, or vice versa. Some consumers might also deploy their systems in a [blue-green fashion](https://en.wikipedia.org/wiki/Blue–green_deployment), in which case they would require *matched* Realtime feeds for >1 Schedule feed *versions* simultaneously.
+Because we also _cannot_ coordinate when both this service _and its consumers_ switch to the latest _version_, **a period of time occurs during which this service still has the previous/old _version_ while the consumer already has the latest**, or vice versa. Some consumers might also deploy their systems in a [blue-green fashion](https://en.wikipedia.org/wiki/Blue–green_deployment), in which case they would require _matched_ Realtime feeds for >1 Schedule feed _versions_ simultaneously.
 
-However, **a Realtime feed is only ever compatible with *one* Schedule feed *version***, because the agency/route/trip IDs need to match. This is why we also **support multiple *versions* of the Schedule feed simultaneously**, allowing each consumer's instance to request the Realtime feed it can process.
+However, **a Realtime feed is only ever compatible with _one_ Schedule feed _version_**, because the agency/route/trip IDs need to match. This is why we also **support multiple _versions_ of the Schedule feed simultaneously**, allowing each consumer's instance to request the Realtime feed it can process.
 
-With `sv` being the number of imported Schedule feed *versions*, we end up with `1 * sv * r` Realtime feeds. In practice, we keep at most 4 *versions* imported.
+With `sv` being the number of imported Schedule feed _versions_, we end up with `1 * sv * r` Realtime feeds. In practice, we keep at most 4 _versions_ imported.
 
-By letting consumers send the *digest* (a.k.a. [hash](https://en.wikipedia.org/wiki/Hash_function)) of the Schedule feed *version* they're using (as a query parameter, see the *API* section), we respond to them with the corresponding *matched* Realtime feed. This opens a large period of time where consumers can switch (the) Schedule feed *version(s)* according to their operational requirements.
-
+By letting consumers send the _digest_ (a.k.a. [hash](https://en.wikipedia.org/wiki/Hash_function)) of the Schedule feed _version_ they're using (as a query parameter, see the _API_ section), we respond to them with the corresponding _matched_ Realtime feed. This opens a large period of time where consumers can switch (the) Schedule feed _version(s)_ according to their operational requirements.
 
 ## Installation
 
 ```shell
-git clone https://github.com/cedarbaum/mta-subway-gtfs-rt-proxy.git
+git clone https://github.com/mobility-solutions-inc/mta-subway-gtfs-rt-proxy.git
 cd mta-subway-gtfs-rt-proxy
-npm install
-npm run build
+corepack enable
+pnpm install
+pnpm run build
 ```
-
 
 ## Usage
 
@@ -101,7 +102,7 @@ If you want to see the logs in a human-readable format, pipe them through `pino-
 
 By default, `mta-subway-gtfs-rt-proxy` obtains MTA's Realtime feeds (1/2/3/4/5/6/7 and A/C/E) every 60 seconds and matches them against the Schedule feed. You can customize this behaviour, as well as many others, [using environment variables](docs/config.md).
 
-
 ## Related
 
+- [Original upstream repository](https://github.com/cedarbaum/mta-subway-gtfs-rt-proxy)
 - [`nyct_gtfs` Python library](https://github.com/Andrew-Dickinson/nyct-gtfs) – Real-time NYC subway data parsing for humans

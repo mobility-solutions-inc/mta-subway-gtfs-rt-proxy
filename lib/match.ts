@@ -1,44 +1,54 @@
-import {cpus as osCpus} from 'node:os'
-import {ok, strictEqual} from 'node:assert'
-import {Gauge} from 'prom-client'
+import { ok, strictEqual } from 'node:assert'
+import { cpus as osCpus } from 'node:os'
 import pLimit from 'p-limit'
-import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
-import {connectToPostgres} from './db.js'
-import {createLogger} from './logger.js'
-import {
-	register as metricsRegister,
-} from './metrics.js'
-import {createMatchTripUpdate} from './match-trip-update.js'
-import {createMatchVehiclePosition} from './match-vehicle-position.js'
-import {createMatchAlert} from './match-alert.js'
-import {createStoreAndRestoreStopTimeUpdatesFromDb} from './restore-stoptimeupdates.js'
-import {createApplyTripReplacementPeriods} from './apply-trip-replacement-periods.js'
+import { Gauge } from 'prom-client'
 
-const MATCHING_LOG_LEVEL = process.env.LOG_LEVEL_MATCHING || 'warn'
+import type {
+	FeedEntity,
+	FeedMessage,
+	MatchConfig,
+	MatchOptions,
+	RealtimeFeedName,
+} from './types.js'
+import { createApplyTripReplacementPeriods } from './apply-trip-replacement-periods.js'
+import { connectToPostgres } from './db.js'
+import { createLogger } from './logger.js'
+import { createMatchAlert } from './match-alert.js'
+import { createMatchTripUpdate } from './match-trip-update.js'
+import { createMatchVehiclePosition } from './match-vehicle-position.js'
+import { register as metricsRegister } from './metrics.js'
+import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
+import { createStoreAndRestoreStopTimeUpdatesFromDb } from './restore-stoptimeupdates.js'
+
+const MATCHING_LOG_LEVEL = process.env.LOG_LEVEL_MATCHING ?? 'warn'
 
 const MATCH_CONCURRENCY = process.env.MATCH_CONCURRENCY
 	? parseInt(process.env.MATCH_CONCURRENCY)
-	// todo: This makes assumptions about the PostgreSQL machine. Query the *PostgreSQL server's* no. of cores, instead of the machine that this code runs on.
-	// There seems to be no clean way – that is allowed with managed DBs, too – to determine this.
-	// For example, the following code isn't allowed to run on DigitalOceans managed DBs:
-	//     CREATE TEMPORARY TABLE cpu_cores (num_cores integer);
-	//     COPY cpu_cores (num_cores) FROM PROGRAM 'sysctl -n hw.ncpu';
-	//     SELECT num_cores FROM cpu_cores LIMIT 1
-	// Twice the number of cores because we (Node process) do other processing between each PostgreSQL query. Also, there is latency between Node and the PostgreSQL machine, especially with a managed DB.
-	: osCpus().length * 2
+	: // todo: This makes assumptions about the PostgreSQL machine. Query the *PostgreSQL server's* no. of cores, instead of the machine that this code runs on.
+		// There seems to be no clean way – that is allowed with managed DBs, too – to determine this.
+		// For example, the following code isn't allowed to run on DigitalOceans managed DBs:
+		//     CREATE TEMPORARY TABLE cpu_cores (num_cores integer);
+		//     COPY cpu_cores (num_cores) FROM PROGRAM 'sysctl -n hw.ncpu';
+		//     SELECT num_cores FROM cpu_cores LIMIT 1
+		// Twice the number of cores because we (Node process) do other processing between each PostgreSQL query. Also, there is latency between Node and the PostgreSQL machine, especially with a managed DB.
+		osCpus().length * 2
 
-const parseEncodedFeed = (feedEncoded) => {
+const parseEncodedFeed = (feedEncoded: Uint8Array): FeedMessage => {
 	// decode feed, validate NyctFeedHeader
 	const feedMessage = gtfsRtBindings.transit_realtime.FeedMessage.toObject(
 		gtfsRtBindings.transit_realtime.FeedMessage.decode(feedEncoded),
-	)
+	) as FeedMessage
 
 	const nyctFeedHeader = feedMessage.header['.nyct_feed_header']
 	if (nyctFeedHeader) {
 		ok(nyctFeedHeader, 'missing FeedMessage.header[".nyct_feed_header"]')
 
 		const nyctSubwayVersion = nyctFeedHeader.nyct_subway_version
-		strictEqual(nyctSubwayVersion, '1.0', 'unsupported NyctFeedHeader.nyct_subway_version')
+		strictEqual(
+			nyctSubwayVersion,
+			'1.0',
+			'unsupported NyctFeedHeader.nyct_subway_version',
+		)
 	}
 
 	return feedMessage
@@ -48,15 +58,23 @@ const _matchingTimeSeconds = new Gauge({
 	name: 'feedmessage_matching_time_seconds',
 	help: 'time needed to match an entire FeedMessage with the GTFS Schedule data',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-	],
+	labelNames: ['schedule_feed_digest'],
 })
 
-const createParseAndProcessFeed = async (cfg) => {
+type CreateParseAndProcessFeedConfig = Pick<
+	MatchConfig,
+	'scheduleFeedDigest' | 'scheduleFeedDigestSlice'
+> & {
+	scheduleDatabaseName: string
+}
+
+const createParseAndProcessFeed = async (
+	cfg: CreateParseAndProcessFeedConfig,
+) => {
 	const {
 		scheduleDatabaseName,
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		// todo: expect realtimeFeedName, pass through to matching fns
 	} = cfg
 	ok(scheduleDatabaseName, 'scheduleDatabaseName must not be empty')
@@ -67,20 +85,23 @@ const createParseAndProcessFeed = async (cfg) => {
 		database: scheduleDatabaseName,
 	})
 
-	const {matchTripUpdate} = createMatchTripUpdate({
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+	const { matchTripUpdate } = createMatchTripUpdate({
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		db,
 		logger: createLogger('match-trip-update', MATCHING_LOG_LEVEL),
 		metricsRegister,
 	})
-	const {matchVehiclePosition} = createMatchVehiclePosition({
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+	const { matchVehiclePosition } = createMatchVehiclePosition({
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		db,
 		logger: createLogger('match-vehicle-position', MATCHING_LOG_LEVEL),
 		metricsRegister,
 	})
-	const {matchAlert} = createMatchAlert({
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+	const { matchAlert } = createMatchAlert({
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		db,
 		logger: createLogger('match-alert', MATCHING_LOG_LEVEL),
 		metricsRegister,
@@ -89,36 +110,40 @@ const createParseAndProcessFeed = async (cfg) => {
 	const runConcurrenctly = pLimit(MATCH_CONCURRENCY)
 
 	const _logger = createLogger('match-feed-message', MATCHING_LOG_LEVEL)
-	const matchFeedMessage = async (feedMessage, opt = {}) => {
-		const {
-			now,
-			realtimeFeedName,
-		} = {
+	const matchFeedMessage = async (
+		feedMessage: FeedMessage,
+		opt: MatchOptions = {},
+	) => {
+		const { now, realtimeFeedName } = {
 			now: Date.now(),
 			realtimeFeedName: null,
 			...opt,
 		}
 
-		const {
-			header: feedHeader,
-		} = feedMessage
+		const { header: feedHeader } = feedMessage
 		const logCtx = {
 			scheduleFeedDigest,
 			realtimeFeedName,
 			feedHeader,
 		}
 
-		const queueFeedEntityMatching = (feedEntity, feedEntitiesIdx) => {
+		const queueFeedEntityMatching = (
+			feedEntity: FeedEntity,
+			feedEntitiesIdx: number,
+		) => {
 			const _logCtx = {
 				...logCtx,
 				feedEntityId: feedEntity.id,
 			}
 			const matchFeedEntity = async () => {
-				_logger.trace({
-					..._logCtx,
-					feedEntitiesIdx,
-					feedEntity,
-				}, 'processing FeedEntity')
+				_logger.trace(
+					{
+						..._logCtx,
+						feedEntitiesIdx,
+						feedEntity,
+					},
+					'processing FeedEntity',
+				)
 
 				try {
 					if (feedEntity.trip_update) {
@@ -138,17 +163,23 @@ const createParseAndProcessFeed = async (cfg) => {
 						})
 					}
 				} catch (err) {
-					_logger.info({
-						..._logCtx,
-						error: err,
-						feedEntitiesIdx,
-					}, 'failed to process FeedEntity')
-					return; // suppress errors, to let other parallel matchFeedEntity() calls keep running
+					_logger.info(
+						{
+							..._logCtx,
+							error: err,
+							feedEntitiesIdx,
+						},
+						'failed to process FeedEntity',
+					)
+					return // suppress errors, to let other parallel matchFeedEntity() calls keep running
 				}
-				_logger.trace({
-					..._logCtx,
-					feedEntitiesIdx,
-				}, 'processed FeedEntity')
+				_logger.trace(
+					{
+						..._logCtx,
+						feedEntitiesIdx,
+					},
+					'processed FeedEntity',
+				)
 			}
 
 			return runConcurrenctly(matchFeedEntity)
@@ -157,13 +188,19 @@ const createParseAndProcessFeed = async (cfg) => {
 		const t0 = performance.now()
 		await Promise.all(feedMessage.entity.map(queueFeedEntityMatching))
 		const matchingTime = (performance.now() - t0) / 1000
-		_matchingTimeSeconds.set({
-			'schedule_feed_digest': scheduleFeedDigestSlice,
-		}, matchingTime)
-		_logger.debug({
-			...logCtx,
+		_matchingTimeSeconds.set(
+			{
+				schedule_feed_digest: scheduleFeedDigestSlice,
+			},
 			matchingTime,
-		}, 'matched FeedMessage')
+		)
+		_logger.debug(
+			{
+				...logCtx,
+				matchingTime,
+			},
+			'matched FeedMessage',
+		)
 	}
 
 	const {
@@ -172,20 +209,25 @@ const createParseAndProcessFeed = async (cfg) => {
 		storeAndRestoreStopTimeUpdatesFromDb,
 		startCleaningOldStoredStopTimeUpdates,
 	} = createStoreAndRestoreStopTimeUpdatesFromDb({
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		db,
 		logger: createLogger('store-stoptimeupdates', MATCHING_LOG_LEVEL),
 		metricsRegister,
 	})
 
 	const applyTripReplacementPeriods = createApplyTripReplacementPeriods({
-		scheduleFeedDigest, scheduleFeedDigestSlice,
+		scheduleFeedDigest,
+		scheduleFeedDigestSlice,
 		db,
 		logger: createLogger('trip-replacement-periods', MATCHING_LOG_LEVEL),
 		metricsRegister,
 	})
 
-	const parseAndProcessFeed = async (feedBuf, realtimeFeedName) => {
+	const parseAndProcessFeed = async (
+		feedBuf: Uint8Array,
+		realtimeFeedName: RealtimeFeedName = null,
+	) => {
 		const feedMessage = parseEncodedFeed(feedBuf)
 
 		await storeAndRestoreStopTimeUpdatesFromDb(feedMessage, {
@@ -202,7 +244,8 @@ const createParseAndProcessFeed = async (cfg) => {
 	}
 
 	// todo: allow disabling this
-	const stopCleaningOldStopTimeUpdatesTimer = startCleaningOldStoredStopTimeUpdates()
+	const stopCleaningOldStopTimeUpdatesTimer =
+		startCleaningOldStoredStopTimeUpdates()
 
 	const stop = async () => {
 		await db.end()
@@ -231,7 +274,4 @@ const createParseAndProcessFeed = async (cfg) => {
 	}
 }
 
-export {
-	parseEncodedFeed,
-	createParseAndProcessFeed,
-}
+export { parseEncodedFeed, createParseAndProcessFeed }

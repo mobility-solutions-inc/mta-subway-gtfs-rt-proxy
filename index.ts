@@ -1,23 +1,51 @@
-import {ok} from 'node:assert'
-import {createServer as createHttpServer} from 'node:http'
-import {createMetricsServer} from './lib/metrics.js'
-import {createLogger} from './lib/logger.js'
-import {ALL_FEEDS} from './lib/feeds.js'
-import {startFetchingRealtimeFeed} from './lib/fetch-realtime-feed.js'
-import {createParseAndProcessFeed} from './lib/match.js'
+import { ok } from 'node:assert'
+import { createServer as createHttpServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+
+import type {
+	HttpRequest,
+	HttpResponse,
+	ScheduleFeedDatabase,
+} from './lib/types.js'
+import { ALL_FEEDS } from './lib/feeds.js'
+import { startFetchingRealtimeFeed } from './lib/fetch-realtime-feed.js'
+import { createLogger } from './lib/logger.js'
+import { createParseAndProcessFeed } from './lib/match.js'
+import { createMetricsServer } from './lib/metrics.js'
 import {
 	queryImportedScheduleFeedVersions,
 	startRefreshingScheduleFeed,
 } from './lib/refresh-schedule-feeds.js'
-import {serveFeed} from './lib/serve-gtfs-rt.js'
+import { serveFeed } from './lib/serve-gtfs-rt.js'
 
-const SERVICE_LOG_LEVEL = process.env.LOG_LEVEL_SERVICE || 'info'
+const SERVICE_LOG_LEVEL = process.env.LOG_LEVEL_SERVICE ?? 'info'
 
-const createService = async (opt = {}) => {
-	const {
-		port,
-	} = {
-		port: parseInt(process.env.PORT || '3000'),
+interface CreateServiceOptions {
+	port?: number
+}
+
+interface FeedHandler {
+	serveFeed: (req: HttpRequest, res: HttpResponse) => void
+	stop: () => void
+}
+
+interface ScheduleFeedHandlers {
+	checkIfHealthy: () => Promise<boolean>
+	closeConnections: () => Promise<void>
+	feedHandlers: Map<string, FeedHandler>
+}
+
+const getPort = (address: AddressInfo | string | null) => {
+	ok(
+		address && typeof address !== 'string',
+		'server address must be an AddressInfo',
+	)
+	return address.port
+}
+
+const createService = async (opt: CreateServiceOptions = {}) => {
+	const { port } = {
+		port: parseInt(process.env.PORT ?? '3000'),
 		...opt,
 	}
 
@@ -27,14 +55,13 @@ const createService = async (opt = {}) => {
 
 	// todo: iterate over all schedule feeds
 	const [scheduleFeed] = ALL_FEEDS
-	logger.debug({
-		feeds: [scheduleFeed],
-	}, 'configured feed(s)')
-	const {
-		scheduleFeedName,
-		scheduleFeedUrl,
-		realtimeFeeds,
-	} = scheduleFeed
+	logger.debug(
+		{
+			feeds: [scheduleFeed],
+		},
+		'configured feed(s)',
+	)
+	const { scheduleFeedName, scheduleFeedUrl, realtimeFeeds } = scheduleFeed
 
 	const logCtx = {
 		scheduleFeedName,
@@ -44,20 +71,20 @@ const createService = async (opt = {}) => {
 	// Each realtime feed neeeds only one fetcher, regardless of how many schedule feeds it is matched against.
 
 	// realtimeFeedName -> {abortFetching, events}
-	const realtimeFetchersByName = new Map()
+	const realtimeFetchersByName = new Map<
+		string,
+		ReturnType<typeof startFetchingRealtimeFeed>
+	>()
 
 	for (const realtimeFeed of realtimeFeeds) {
-		const {
-			realtimeFeedName,
-			realtimeFeedUrl,
-			realtimeFeedApiKey,
-		} = realtimeFeed
-		logger.debug(logCtx, `setting up realtime feed fetcher for "${realtimeFeedName}"`)
+		const { realtimeFeedName, realtimeFeedUrl, realtimeFeedApiKey } =
+			realtimeFeed
+		logger.debug(
+			logCtx,
+			`setting up realtime feed fetcher for "${realtimeFeedName}"`,
+		)
 
-		const {
-			abortFetching,
-			events,
-		} = startFetchingRealtimeFeed({
+		const { abortFetching, events } = startFetchingRealtimeFeed({
 			realtimeFeedName,
 			realtimeFeedUrl,
 			realtimeFeedApiKey,
@@ -81,15 +108,24 @@ const createService = async (opt = {}) => {
 	// 	feedHandlers: realtimeFeedName -> {serveFeed, stop},
 	// 	closeConnections,
 	// }
-	const feedHandlersByScheduleFeedDigest = new Map()
+	const feedHandlersByScheduleFeedDigest = new Map<
+		string,
+		ScheduleFeedHandlers
+	>()
 
-	const addScheduleFeedVersion = async (scheduleFeedDigest, scheduleDatabaseName) => {
+	const addScheduleFeedVersion = async (
+		scheduleFeedDigest: string,
+		scheduleDatabaseName: string,
+	) => {
 		const _logCtx = {
 			...logCtx,
 			scheduleFeedDigest,
 			scheduleDatabaseName,
 		}
-		logger.info(_logCtx, `creating new matcher for schedule database "${scheduleDatabaseName}"`)
+		logger.info(
+			_logCtx,
+			`creating new matcher for schedule database "${scheduleDatabaseName}"`,
+		)
 
 		// Note: Prometheus stores time series per combination of label values, so having labels with a high or even unbound cardinality is a problem. We still want to be able to tell the schedule databases' metrics apart in the monitoring system, so we add the first hex digit (with a cardinality of 16) of the GTFS Schedule feed's hash as a label.
 		// see also https://www.robustperception.io/cardinality-is-key/
@@ -106,47 +142,57 @@ const createService = async (opt = {}) => {
 			scheduleFeedDigestSlice,
 		})
 
-		const createFeedHandler = (realtimeFeedName) => {
+		const createFeedHandler = (realtimeFeedName: string): FeedHandler => {
 			const __logCtx = {
 				..._logCtx,
 				realtimeFeedName,
 			}
 			logger.debug(__logCtx, 'setting up feed handler')
 
-			const {
-				setFeed: setFeedMessage,
-				onRequest: serveFeedOnRequest,
-			} = serveFeed({
-				scheduleFeedDigest, scheduleFeedDigestSlice,
-			})
+			const { setFeed: setFeedMessage, onRequest: serveFeedOnRequest } =
+				serveFeed({
+					scheduleFeedDigest,
+					scheduleFeedDigestSlice,
+				})
 
-			const processRealtimeFeed = ({feedEncoded}) => {
-				logger.trace({
-					...__logCtx,
-					feedEncoded,
-				}, 'processing realtime feed')
+			const processRealtimeFeed = ({
+				feedEncoded,
+			}: {
+				feedEncoded: Buffer
+			}) => {
+				logger.trace(
+					{
+						...__logCtx,
+						feedEncoded,
+					},
+					'processing realtime feed',
+				)
 
-				;(async () => {
+				void (async () => {
 					// todo: pass in `realtimeFeedName` for logging
-					const feedMessage = await parseAndMatchRealtimeFeed(feedEncoded, realtimeFeedName)
+					const feedMessage = await parseAndMatchRealtimeFeed(
+						feedEncoded,
+						realtimeFeedName,
+					)
 					setFeedMessage(feedMessage)
 					logger.debug(__logCtx, 'successfully processed realtime feed update')
-				})()
-				.catch((err) => {
+				})().catch((err: unknown) => {
 					// todo: only warn-log for certain errors, otherwise error-log
-					logger.warn({
-						...__logCtx,
-						error: err,
-					}, 'failed to process realtime feed update')
+					logger.warn(
+						{
+							...__logCtx,
+							error: err,
+						},
+						'failed to process realtime feed update',
+					)
 				})
 				// todo: add metrics for success/fail
 			}
 
 			// connect with realtime fetcher
 			ok(realtimeFetchersByName.has(realtimeFeedName), realtimeFeedName)
-			const {
-				events: realtimeFeedEvents,
-			} = realtimeFetchersByName.get(realtimeFeedName)
+			const { events: realtimeFeedEvents } =
+				realtimeFetchersByName.get(realtimeFeedName)!
 			realtimeFeedEvents.on('update', processRealtimeFeed)
 			const stopListeningToRealtimeFeedUpdates = () => {
 				realtimeFeedEvents.removeListener('update', processRealtimeFeed)
@@ -158,8 +204,8 @@ const createService = async (opt = {}) => {
 			}
 		}
 
-		const feedHandlers = new Map()
-		for (const {realtimeFeedName} of realtimeFeeds) {
+		const feedHandlers = new Map<string, FeedHandler>()
+		for (const { realtimeFeedName } of realtimeFeeds) {
 			const feedHandler = createFeedHandler(realtimeFeedName)
 			feedHandlers.set(realtimeFeedName, feedHandler)
 		}
@@ -172,21 +218,25 @@ const createService = async (opt = {}) => {
 	}
 
 	// todo: isn't this function called only after the database has been (attempted to get) removed? why close client connections then? solving this properly needs v5 of postgis-gtfs-importer.
-	const removeScheduleFeedVersion = (scheduleFeedDigest) => {
-		logger.info(logCtx, `removing obsolete matcher for digest "${scheduleFeedDigest}"`)
+	const removeScheduleFeedVersion = (scheduleFeedDigest: string) => {
+		logger.info(
+			logCtx,
+			`removing obsolete matcher for digest "${scheduleFeedDigest}"`,
+		)
 
-		const {
-			feedHandlers,
-			closeConnections,
-		} = feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
+		const { feedHandlers, closeConnections } =
+			feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)!
 
 		for (const feedHandler of feedHandlers.values()) {
 			feedHandler.stop()
 		}
 
-		closeConnections()
-		.catch((err) => {
-			logger.warn(logCtx, `failed to closeConnections obsolete matcher for digest "${scheduleFeedDigest}": ${err.message}`)
+		closeConnections().catch((err: unknown) => {
+			const message = err instanceof Error ? err.message : String(err)
+			logger.warn(
+				logCtx,
+				`failed to closeConnections obsolete matcher for digest "${scheduleFeedDigest}": ${message}`,
+			)
 			logger.debug(err)
 		})
 
@@ -195,14 +245,17 @@ const createService = async (opt = {}) => {
 
 	// ## refreshing of GTFS Schedule feeds
 
-	let currentDatabases = []
+	let currentDatabases: ScheduleFeedDatabase[] = []
 	{
 		currentDatabases = await queryImportedScheduleFeedVersions({
 			scheduleFeedName,
 		})
 		// todo: do this in parallel?
-		for (const {name, feedDigest} of currentDatabases) {
-			logger.trace(logCtx, `adding handlers for already imported schedule feed version with digest "${feedDigest}"`)
+		for (const { name, feedDigest } of currentDatabases) {
+			logger.trace(
+				logCtx,
+				`adding handlers for already imported schedule feed version with digest "${feedDigest}"`,
+			)
 			await addScheduleFeedVersion(feedDigest, name)
 		}
 	}
@@ -213,25 +266,37 @@ const createService = async (opt = {}) => {
 	} = startRefreshingScheduleFeed({
 		scheduleFeedName,
 		scheduleFeedUrl,
-		onImportDone: ({currentDatabases: _currentDatabases}) => {
+		onImportDone: ({ currentDatabases: _currentDatabases }) => {
 			currentDatabases = _currentDatabases
-			logger.trace(logCtx, 'currently imported databases: ' + currentDatabases.map(db => db.name).join(', '))
+			logger.trace(
+				logCtx,
+				'currently imported databases: ' +
+					currentDatabases.map((db) => db.name).join(', '),
+			)
 
 			for (const oldScheduleFeedDigest of feedHandlersByScheduleFeedDigest.keys()) {
-				if (!currentDatabases.find(({feedDigest}) => feedDigest === oldScheduleFeedDigest)) {
-					logger.trace(logCtx, `removing handlers for obsolete schedule feed version with digest "${oldScheduleFeedDigest}"`)
+				if (
+					!currentDatabases.find(
+						({ feedDigest }) => feedDigest === oldScheduleFeedDigest,
+					)
+				) {
+					logger.trace(
+						logCtx,
+						`removing handlers for obsolete schedule feed version with digest "${oldScheduleFeedDigest}"`,
+					)
 					removeScheduleFeedVersion(oldScheduleFeedDigest)
 				}
 			}
 
 			for (const newScheduleFeedVersion of currentDatabases) {
-				const {
-					name: scheduleDatabaseName,
-					feedDigest: scheduleFeedDigest,
-				} = newScheduleFeedVersion
+				const { name: scheduleDatabaseName, feedDigest: scheduleFeedDigest } =
+					newScheduleFeedVersion
 				if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
-					logger.trace(logCtx, `adding handlers for new schedule feed version with digest "${scheduleFeedDigest}"`)
-					addScheduleFeedVersion(scheduleFeedDigest, scheduleDatabaseName)
+					logger.trace(
+						logCtx,
+						`adding handlers for new schedule feed version with digest "${scheduleFeedDigest}"`,
+					)
+					void addScheduleFeedVersion(scheduleFeedDigest, scheduleDatabaseName)
 				}
 			}
 		},
@@ -240,15 +305,19 @@ const createService = async (opt = {}) => {
 	// ## serve matched realtime feeds via HTTP
 
 	// modeled after https://github.com/derhuerst/hafas-gtfs-rt-feed/blob/8.2.3/lib/serve.js#L156-L217
-	const onRequest = (req, res) => {
-		logger.trace({
-			httpVersion: req.httpVersion,
-			method: req.method,
-			url: req.url,
-			headers: req.headers,
-		}, 'handling incoming HTTP request')
-		const url = new URL(req.url, 'http://localhost')
-		const pathComponents = url.pathname === '/' ? [] : url.pathname.slice(1).split('/')
+	const onRequest = (req: HttpRequest, res: HttpResponse) => {
+		logger.trace(
+			{
+				httpVersion: req.httpVersion,
+				method: req.method,
+				url: req.url,
+				headers: req.headers,
+			},
+			'handling incoming HTTP request',
+		)
+		const url = new URL(req.url ?? '/', 'http://localhost')
+		const pathComponents =
+			url.pathname === '/' ? [] : url.pathname.slice(1).split('/')
 
 		// /feeds
 		if (pathComponents[0] === 'feeds' && pathComponents.length === 1) {
@@ -260,16 +329,21 @@ const createService = async (opt = {}) => {
 				if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
 					return []
 				}
-				const realtimeFeedNames = Array.from(feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest).feedHandlers.keys())
+				const handlers =
+					feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
+				ok(handlers, 'missing feed handlers')
+				const realtimeFeedNames = Array.from(handlers.feedHandlers.keys())
 				return realtimeFeedNames.map((realtimeFeedName) => ({
 					realtimeFeedName,
 					scheduleFeedDigest,
-					scheduleFeedImportedAt: new Date(scheduleFeedImportedAt * 1000).toISOString(),
+					scheduleFeedImportedAt: new Date(
+						scheduleFeedImportedAt * 1000,
+					).toISOString(),
 				}))
 			})
 			res.setHeader('content-type', 'application/json')
 			res.end(JSON.stringify(body))
-			return;
+			return
 		}
 
 		// /feeds/:realtimeFeedName?schedule-feed-digest
@@ -279,68 +353,73 @@ const createService = async (opt = {}) => {
 			if (!realtimeFetchersByName.has(realtimeFeedName)) {
 				res.statusCode = 404
 				res.end('invalid realtime feed name')
-				return;
+				return
 			}
 
 			if (!url.searchParams.has('schedule-feed-digest')) {
 				res.statusCode = 400
 				res.end('missing schedule-feed-digest parameter')
-				return;
+				return
 			}
 			const scheduleFeedDigest = url.searchParams.get('schedule-feed-digest')
+			ok(scheduleFeedDigest, 'missing schedule-feed-digest parameter')
 			if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
 				res.statusCode = 404
 				res.end('invalid/unknown schedule-feed-digest')
-				return;
+				return
 			}
 
-			const {
-				feedHandlers,
-			} = feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
-			const {
-				serveFeed,
-			} = feedHandlers.get(realtimeFeedName)
+			const { feedHandlers } =
+				feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)!
+			const { serveFeed } = feedHandlers.get(realtimeFeedName)!
 			serveFeed(req, res)
-			return;
+			return
 		}
 
 		if (pathComponents[0] === 'health' && pathComponents.length === 1) {
-			;(async () => {
+			void (async () => {
 				try {
 					const statuses = await Promise.all([
 						checkIfScheduleFeedRefreshIsHealthy(),
-						...(
-							Array.from(feedHandlersByScheduleFeedDigest.values())
-							.flatMap(({checkIfHealthy}) => checkIfHealthy())
+						...Array.from(feedHandlersByScheduleFeedDigest.values()).flatMap(
+							({ checkIfHealthy }) => checkIfHealthy(),
 						),
 					])
-					res.statusCode = statuses.some(status => status !== true) ? 503 : 200
+					res.statusCode = statuses.some((status) => status !== true)
+						? 503
+						: 200
 					res.end('')
 				} catch (err) {
-					logger.warn({
-						error: err,
-					}, 'failed to check if healthy')
+					logger.warn(
+						{
+							error: err,
+						},
+						'failed to check if healthy',
+					)
 					res.statusCode = 503 // Service Unavailable
 					res.end('')
 				}
 			})()
-			return;
+			return
 		}
 		if (pathComponents[0] === 'ready' && pathComponents.length === 1) {
-			;(async () => {
+			void (async () => {
 				try {
 					const isReady = await checkIfScheduleFeedRefreshIsReady()
 					res.statusCode = isReady ? 200 : 503
 					res.end('')
 				} catch (err) {
-					logger.warn({
-						error: err,
-					}, 'failed to check if ready')
+					logger.warn(
+						{
+							error: err,
+						},
+						'failed to check if ready',
+					)
 					res.statusCode = 503 // Service Unavailable
 					res.end('')
 				}
 			})()
-			return;
+			return
 		}
 
 		res.statusCode = 404
@@ -349,23 +428,26 @@ const createService = async (opt = {}) => {
 
 	// todo: enable CORS?
 	const server = createHttpServer(onRequest)
-	await new Promise((resolve, reject) => {
-		server.listen(port, (err) => {
-			if (err) reject(err)
-			else resolve()
+	await new Promise<void>((resolve) => {
+		server.listen(port, () => {
+			resolve()
 		})
 	})
-	logger.info(`listening on port ${server.address().port}`)
+	logger.info(`listening on port ${getPort(server.address())}`)
 
 	await metricsServer.start()
-	logger.info(`metrics server listening on port ${metricsServer.address().port}`)
+	logger.info(
+		`metrics server listening on port ${getPort(metricsServer.address())}`,
+	)
 
 	const stopService = async () => {
 		// todo: info-log
-		for (const {abortFetching} of realtimeFetchersByName.values()) {
-			await abortFetching()
+		for (const { abortFetching } of realtimeFetchersByName.values()) {
+			abortFetching()
 		}
-		for (const {closeConnections} of feedHandlersByScheduleFeedDigest.values()) {
+		for (const {
+			closeConnections,
+		} of feedHandlersByScheduleFeedDigest.values()) {
 			await closeConnections()
 		}
 		server.close()
@@ -376,6 +458,4 @@ const createService = async (opt = {}) => {
 	}
 }
 
-export {
-	createService,
-}
+export { createService }

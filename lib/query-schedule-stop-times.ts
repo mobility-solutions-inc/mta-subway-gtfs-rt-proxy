@@ -1,9 +1,34 @@
-import {ok, strictEqual} from 'node:assert'
+import { ok, strictEqual } from 'node:assert'
+import type { Counter, Summary } from 'prom-client'
+
+import type { Db, Logger, ScheduleStopTime } from './types.js'
 
 // Make customizable to allow testing with other GTFS Schedule feeds.
-const TRIP_ID_SUFFIX_SEPARATOR = process.env.TRIP_ID_SUFFIX_SEPARATOR || '_'
+const TRIP_ID_SUFFIX_SEPARATOR = process.env.TRIP_ID_SUFFIX_SEPARATOR ?? '_'
 
-const _buildScheduleStopTimesQuery = (cfg) => {
+interface BuildScheduleStopTimesQueryConfig {
+	isoStartDate: string
+	matchLimit: number
+	queryNameSuffix: string
+	queryTripStopTimes: boolean
+	route_id: string
+	stop_id: string | null
+	stop_sequence: number | null
+	tripIdFilterClause: string
+	tripIdLiteral: string
+	tripStopTimesLimit: number
+}
+
+interface ScheduleStopTimesQuery {
+	matchingMethod: string
+	name: string
+	text: string
+	values: (number | string)[]
+}
+
+const _buildScheduleStopTimesQuery = (
+	cfg: BuildScheduleStopTimesQueryConfig,
+): ScheduleStopTimesQuery => {
 	const {
 		queryNameSuffix,
 		route_id,
@@ -44,13 +69,13 @@ const _buildScheduleStopTimesQuery = (cfg) => {
 	ORDER BY stop_sequence_consec ASC
 	LIMIT $5
 `
-	let values = [
+	const values: (number | string)[] = [
 		route_id,
-		stop_id === null ? 1 : stop_id,
+		stop_id ?? 1,
 		isoStartDate,
 		tripIdLiteral,
 		matchLimit,
-		stop_sequence === null ? 1 : stop_sequence,
+		stop_sequence ?? 1,
 	]
 
 	if (queryTripStopTimes) {
@@ -68,17 +93,17 @@ WHERE ad."date" = (SELECT "date" FROM st)
 AND ad.trip_id = (SELECT trip_id FROM st)
 LIMIT $7
 `
-		values.push(
-			tripStopTimesLimit,
-		)
+		values.push(tripStopTimesLimit)
 	}
 
 	return {
 		// allow `pg` to create a prepared statement
 		name: [
 			queryTripStopTimes ? 'trip_' : 'stop_times_',
-			matchLimit, '_',
-			tripStopTimesLimit, '_',
+			matchLimit,
+			'_',
+			tripStopTimesLimit,
+			'_',
 			queryNameSuffix,
 			stop_id === null ? '' : '_stop_id',
 			stop_sequence === null ? '' : '_stop_seq',
@@ -104,7 +129,28 @@ const subdivisionsByRouteId = new Map([
 // 2. Match a single stop_time (as with 1.), but query all of its trip's stop_times.
 // The caller chooses which behaviour to run using the `queryTripStopTimes` flag.
 // todo: query & expose start_time?
-const queryScheduleStopTimes = async (cfg) => {
+interface QueryScheduleStopTimesConfig {
+	db: Db
+	dbQueryTimeSeconds: Summary<string>
+	isMatch: (scheduleStopTimes: ScheduleStopTime[]) => boolean
+	logger: Logger
+	matchLimit: number
+	matchingFailures: Counter<string>
+	matchingSuccesses: Counter<string>
+	queryTripStopTimes: boolean
+	realtimeFeedName?: string | null
+	route_id: string
+	scheduleFeedDigestSlice: string
+	start_date: string
+	stop_id?: string | null
+	stop_sequence?: number | null
+	trip_id: string
+	tripStopTimesLimit: number
+}
+
+const queryScheduleStopTimes = async (
+	cfg: QueryScheduleStopTimesConfig,
+): Promise<ScheduleStopTime[]> => {
 	const {
 		logger,
 		route_id,
@@ -135,24 +181,30 @@ const queryScheduleStopTimes = async (cfg) => {
 
 	// Without stop_id, it is not possible to unambiguously identify the targeted trip "instance", as there might be two trips with the same trip_id *suffix* running by the same stop one the same date.
 	if (stop_id === null) {
-		logger.warn({
-			...logCtx,
-			route_id,
-			start_date,
-			trip_id,
-			stop_id,
-			stop_sequence,
-		}, 'matching without stop_id, risking incorrectly matched trip')
-	// On top, with trips running loops (visiting a stop more than once), we need stop_sequence to uniquely identify which visit to match.
+		logger.warn(
+			{
+				...logCtx,
+				route_id,
+				start_date,
+				trip_id,
+				stop_id,
+				stop_sequence,
+			},
+			'matching without stop_id, risking incorrectly matched trip',
+		)
+		// On top, with trips running loops (visiting a stop more than once), we need stop_sequence to uniquely identify which visit to match.
 	} else if (stop_sequence === null) {
-		logger.warn({
-			...logCtx,
-			route_id,
-			start_date,
-			trip_id,
-			stop_id,
-			stop_sequence,
-		}, 'matching without stop_id, risking incorrectly matched stop_times row')
+		logger.warn(
+			{
+				...logCtx,
+				route_id,
+				start_date,
+				trip_id,
+				stop_id,
+				stop_sequence,
+			},
+			'matching without stop_id, risking incorrectly matched stop_times row',
+		)
 	}
 
 	const metricsCtx = {
@@ -162,9 +214,9 @@ const queryScheduleStopTimes = async (cfg) => {
 
 	// convert to ISO 8601 (PostgreSQL-compatible)
 	const isoStartDate = [
-		start_date.substr(0, 4),
-		start_date.substr(4, 2),
-		start_date.substr(6, 2),
+		start_date.slice(0, 4),
+		start_date.slice(4, 6),
+		start_date.slice(6, 8),
 	].join('-')
 
 	// First, naively assume that the GTFS Realtime trip ID matches the Schedule feed.
@@ -184,14 +236,17 @@ const queryScheduleStopTimes = async (cfg) => {
 		})
 
 		const t0 = performance.now()
-		const {rows: scheduleStopTimes} = await db.query(query)
+		const { rows: scheduleStopTimes } = await db.query<ScheduleStopTime>(query)
 		const matching = isMatch(scheduleStopTimes)
 
-		dbQueryTimeSeconds.observe({
-			...metricsCtx,
-			success: matching,
-			matching_method: query.matchingMethod,
-		}, (performance.now() - t0) / 1000)
+		dbQueryTimeSeconds.observe(
+			{
+				...metricsCtx,
+				success: String(matching),
+				matching_method: query.matchingMethod,
+			},
+			(performance.now() - t0) / 1000,
+		)
 		if (matching) {
 			matchingSuccesses.inc({
 				...metricsCtx,
@@ -223,18 +278,22 @@ const queryScheduleStopTimes = async (cfg) => {
 			// > 2. `20111204` – Effective date of the base schedule, Dec 4, 2011
 			start_date,
 			// > 3. `SAT` – Is the applicable service code. Typically it will be `WKD`-Weekday, `SAT`-Saturday or `SUN`- Sunday
-			([
+			[
 				'SUN',
-				'WKD', 'WKD', 'WKD', 'WKD', 'WKD', // Monday to Friday
+				'WKD',
+				'WKD',
+				'WKD',
+				'WKD',
+				'WKD', // Monday to Friday
 				'SAT',
-			])[startDayOfTheWeek],
+			][startDayOfTheWeek],
 			'_',
 			// > 4. `021150` – This identifies the trips origin time. Times are coded reflecting hundredths of a minute past midnight and converts to (03:31:30 also described as 0331+ where the + equals 30 seconds). This format provides more "precision" than can be realistically attributed to a transit operation, and most applications can safely round or truncate these numbers to the nearest minute. Since Transit authority internal timetables frequently involve half-minute scheduling, systems involved in train control or monitoring will need to represent times in a more accurate manner (to at least the half minute, and perhaps to the tenth minute or one second level). It should be noted that the service associated with a single day's subway schedule is not necessarily confined to a twenty-four hour period. Negative numbers reflect times prior to the day of the schedule (-0000200 refers to 11:58 PM yesterday) and numbers exceeding 00144000 (a day has 1440 minutes) reflect times beyond the day of the schedule (00145000 refers to 12:10 AM tomorrow).
 			// > 5. `2..N08R` – This identifies the Trip Path (stopping pattern) for a unique train trip. This can be decomposed into the Route ID (aka service, 2 train) Direction (Northbound train) and Path Identifier (08R). Internally this path provides operations planning such information as origination, destination, all stops, routing scheme (express/local) in Manhattan/Bronx/Brooklyn, operating time periods, and shape (circle = local, diamond = express).
 			trip_id,
 		].join('')
 
-		const query = _buildScheduleStopTimesQuery({
+		const _query = _buildScheduleStopTimesQuery({
 			queryNameSuffix: 'exact_constructed',
 			route_id,
 			stop_id,
@@ -295,17 +354,23 @@ const queryScheduleStopTimes = async (cfg) => {
 			tripStopTimesLimit,
 		})
 		// todo [breaking]: remove "stop_times"
-		const matching_method = query.matchingMethod.replace(/by_suffix_\d+/, 'by_suffix')
+		const matching_method = query.matchingMethod.replace(
+			/by_suffix_\d+/,
+			'by_suffix',
+		)
 
 		const t0 = performance.now()
-		const {rows: scheduleStopTimes} = await db.query(query)
+		const { rows: scheduleStopTimes } = await db.query<ScheduleStopTime>(query)
 		const matching = isMatch(scheduleStopTimes)
 
-		dbQueryTimeSeconds.observe({
-			...metricsCtx,
-			success: matching,
-			matching_method,
-		}, (performance.now() - t0) / 1000)
+		dbQueryTimeSeconds.observe(
+			{
+				...metricsCtx,
+				success: String(matching),
+				matching_method,
+			},
+			(performance.now() - t0) / 1000,
+		)
 
 		if (matching) {
 			matchingSuccesses.inc({
@@ -323,6 +388,4 @@ const queryScheduleStopTimes = async (cfg) => {
 	return []
 }
 
-export {
-	queryScheduleStopTimes,
-}
+export { queryScheduleStopTimes }

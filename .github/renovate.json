@@ -1,0 +1,61 @@
+{
+	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"extends": ["config:best-practices"],
+	"timezone": "America/New_York",
+	"dependencyDashboard": true,
+	"dependencyDashboardApproval": true,
+	"schedule": ["before 7:00am"],
+	"git-submodules": {
+		"enabled": true
+	},
+	"ignoreDeps": ["python-nyct-gtfs"],
+	"customManagers": [
+		{
+			"customType": "regex",
+			"description": "Keep the Node.js runtime version aligned across package engines, Docker base images, and GitHub Actions.",
+			"managerFilePatterns": [
+				"/^package\\.json$/",
+				"/^Dockerfile$/",
+				"/^\\.github/workflows/.*\\.ya?ml$/"
+			],
+			"matchStrings": [
+				"\"node\":\\s*\">=(?<currentValue>[\\d.]+)\"",
+				"FROM node:(?<currentValue>[\\d.]+)-alpine",
+				"node-version:\\s*\\[?['\"]?(?<currentValue>[\\d.]+)"
+			],
+			"datasourceTemplate": "node-version",
+			"depNameTemplate": "node",
+			"versioningTemplate": "node"
+		}
+	],
+	"vulnerabilityAlerts": {
+		"labels": ["security"],
+		"schedule": "at any time",
+		"minimumReleaseAge": null
+	},
+	"packageRules": [
+		{
+			"description": "engines.node is maintained via custom.regex + node-version datasource.",
+			"enabled": false,
+			"matchDepTypes": ["engines"],
+			"matchManagers": ["npm"],
+			"matchPackageNames": ["node"]
+		},
+		{
+			"description": "Keep Node.js runtime updates aligned across package engines, Docker base images, and GitHub Actions.",
+			"groupName": "Node.js runtime",
+			"matchDatasources": ["docker", "node-version"],
+			"matchDepNames": ["/^node(?:\\.js)?$/"],
+			"matchManagers": ["custom.regex", "dockerfile"]
+		},
+		{
+			"description": "Keep pnpm package manager metadata aligned.",
+			"groupName": "pnpm runtime",
+			"matchPackageNames": ["pnpm"]
+		}
+	],
+	"automerge": true,
+	"minimumReleaseAge": "3 days",
+	"reviewers": ["@ctriley"],
+	"assignees": ["@ctriley"]
+}

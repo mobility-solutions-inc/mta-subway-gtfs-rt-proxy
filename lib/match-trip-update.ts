@@ -1,29 +1,57 @@
-import {Counter, Summary} from 'prom-client'
-import {toBigInt as protobufJsLongToBigInt} from 'longfn'
+import { ok } from 'node:assert'
+import { Counter, Summary } from 'prom-client'
+
+import type {
+	MatchConfig,
+	MatchOptions,
+	ProtobufLong,
+	ScheduleStopTime,
+	StopTimeUpdate,
+	TripUpdate,
+} from './types.js'
+import { register as metricsRegister } from './metrics.js'
 import gtfsRtBindings from './mta-gtfs-realtime.pb.js'
-import {register as metricsRegister} from './metrics.js'
-import {queryScheduleStopTimes} from './query-schedule-stop-times.js'
+import { protobufLongToBigInt, protobufLongToNumber } from './protobuf.js'
+import { queryScheduleStopTimes } from './query-schedule-stop-times.js'
 
-const {ScheduleRelationship} = gtfsRtBindings.transit_realtime.TripDescriptor
+const { ScheduleRelationship: TripScheduleRelationship } =
+	gtfsRtBindings.transit_realtime.TripDescriptor
+const { ScheduleRelationship: StopTimeUpdateScheduleRelationship } =
+	gtfsRtBindings.transit_realtime.TripUpdate.StopTimeUpdate
 
-const estimateDelayFromUpcomingArrivalOrDeparture = (tripUpdate, now = Date.now()) => {
+interface DelayEstimate {
+	delay: number
+	kind: 'arrival' | 'departure'
+	stopTimeUpdatesIdx: number
+}
+
+const estimateDelayFromUpcomingArrivalOrDeparture = (
+	tripUpdate: TripUpdate,
+	now = Date.now(),
+): DelayEstimate | null => {
 	// find first arrival/departure that is in the future
-	now = now / 1000 | 0
-	for (let i = 0; i < tripUpdate.stop_time_update.length; i++) {
-		const stopTimeUpdate = tripUpdate.stop_time_update[i]
-		const {
-			arrival: arr,
-			departure: dep,
-		} = stopTimeUpdate
+	now = (now / 1000) | 0
+	const stopTimeUpdates = tripUpdate.stop_time_update ?? []
+	for (let i = 0; i < stopTimeUpdates.length; i++) {
+		const stopTimeUpdate = stopTimeUpdates[i]
+		const { arrival: arr, departure: dep } = stopTimeUpdate
 
-		if (arr?.time > now && ('delay' in arr)) {
+		if (
+			arr?.time &&
+			protobufLongToNumber(arr.time) > now &&
+			typeof arr.delay === 'number'
+		) {
 			return {
 				stopTimeUpdatesIdx: i,
 				kind: 'arrival',
 				delay: arr.delay,
 			}
 		}
-		if (dep?.time > now && ('delay' in dep)) {
+		if (
+			dep?.time &&
+			protobufLongToNumber(dep.time) > now &&
+			typeof dep.delay === 'number'
+		) {
 			return {
 				stopTimeUpdatesIdx: i,
 				kind: 'departure',
@@ -49,54 +77,36 @@ const matchingSuccesses = new Counter({
 	name: 'tripupdates_matching_successes_total',
 	help: 'number of successfully matched TripUpdates',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-		'matching_method',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id', 'matching_method'],
 })
 const matchingFailures = new Counter({
 	name: 'tripupdates_matching_failures_total',
 	help: 'number of unsuccessfully matched TripUpdates',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-		'matching_method',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id', 'matching_method'],
 })
 const stopTimeUpdateMatchingSuccesses = new Counter({
 	name: 'tripupdates_stoptimeupdate_matching_successes_total',
 	help: 'number of successfully matched TripUpdates',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id'],
 })
 const stopTimeUpdateMatchingFailures = new Counter({
 	name: 'tripupdates_stoptimeupdate_matching_failures_total',
 	help: 'number of successfully matched TripUpdates',
 	registers: [metricsRegister],
-	labelNames: [
-		'schedule_feed_digest',
-		'route_id',
-	],
+	labelNames: ['schedule_feed_digest', 'route_id'],
 })
 
-const createMatchTripUpdate = (cfg) => {
-	const {
-		scheduleFeedDigest, scheduleFeedDigestSlice,
-		db,
-		logger,
-	} = cfg
+const createMatchTripUpdate = (cfg: MatchConfig) => {
+	const { scheduleFeedDigest, scheduleFeedDigestSlice, db, logger } = cfg
 
 	// Note: This function mutates `tripUpdate`.
-	const matchTripUpdate = async (tripUpdate, opt = {}) => {
-		const {
-			now,
-			realtimeFeedName,
-		} = {
+	const matchTripUpdate = async (
+		tripUpdate: TripUpdate,
+		opt: MatchOptions = {},
+	) => {
+		const { now, realtimeFeedName } = {
 			now: Date.now(),
 			realtimeFeedName: null,
 			...opt,
@@ -107,44 +117,66 @@ const createMatchTripUpdate = (cfg) => {
 			start_date: startDate,
 			trip_id: realtimeTripId,
 		} = tripUpdate.trip
-		const nyctTripDescriptor = tripUpdate.trip['.nyct_trip_descriptor'] || null
+		ok(route_id, 'missing/empty TripUpdate.trip.route_id')
+		ok(startDate, 'missing/empty TripUpdate.trip.start_date')
+		ok(realtimeTripId, 'missing/empty TripUpdate.trip.trip_id')
+		const nyctTripDescriptor = tripUpdate.trip['.nyct_trip_descriptor'] ?? null
 
-		const logCtx = {
+		const logCtx: Record<string, unknown> = {
 			scheduleFeedDigest,
 			realtimeFeedName,
 			routeId: route_id,
 			startDate,
 			realtimeTripId,
 		}
-		logger.trace({
-			...logCtx,
-			tripUpdate,
-		}, 'matching TripUpdate')
+		logger.trace(
+			{
+				...logCtx,
+				tripUpdate,
+			},
+			'matching TripUpdate',
+		)
 
 		// find StopTimeUpdate with stop_id & stop_sequence, fall back to one with only stop_id
-		if (!tripUpdate.stop_time_update || tripUpdate.stop_time_update.length === 0) {
+		const stopTimeUpdates = tripUpdate.stop_time_update
+		if (!stopTimeUpdates || stopTimeUpdates.length === 0) {
 			logger.warn(logCtx, 'cannot match TripUpdate, it has 0 StopTimeUpdates')
 			return null
 		}
-		let someStopTimeUpdate = tripUpdate.stop_time_update
-		.find(sTU => typeof sTU.stop_id === 'string' && Number.isInteger(sTU.stop_sequence))
+		let someStopTimeUpdate: StopTimeUpdate | undefined = stopTimeUpdates.find(
+			(sTU) =>
+				typeof sTU.stop_id === 'string' && Number.isInteger(sTU.stop_sequence),
+		)
 		if (!someStopTimeUpdate) {
-			logger.warn(logCtx, 'cannot match TripUpdate unambiguously, it has no StopTimeUpdate with stop_id & stop_sequence; now matching ambiguously')
+			logger.warn(
+				logCtx,
+				'cannot match TripUpdate unambiguously, it has no StopTimeUpdate with stop_id & stop_sequence; now matching ambiguously',
+			)
 		}
-		someStopTimeUpdate = tripUpdate.stop_time_update
-		.find(sTU => typeof sTU.stop_id === 'string')
+		someStopTimeUpdate = stopTimeUpdates.find(
+			(sTU) => typeof sTU.stop_id === 'string',
+		)
 		if (!someStopTimeUpdate) {
-			logger.warn(logCtx, 'cannot match TripUpdate at all, it has no StopTimeUpdate with stop_id')
+			logger.warn(
+				logCtx,
+				'cannot match TripUpdate at all, it has no StopTimeUpdate with stop_id',
+			)
 			return null
 		}
+		const someStopId = someStopTimeUpdate.stop_id
+		ok(
+			typeof someStopId === 'string' && someStopId,
+			'missing StopTimeUpdate.stop_id',
+		)
 
-		const isMatch = scheduleStopTimes => scheduleStopTimes.length > 0
+		const isMatch = (scheduleStopTimes: ScheduleStopTime[]) =>
+			scheduleStopTimes.length > 0
 		const scheduleStopTimes = await queryScheduleStopTimes({
 			logger,
 			route_id,
 			start_date: startDate,
 			trip_id: realtimeTripId,
-			stop_id: someStopTimeUpdate.stop_id,
+			stop_id: someStopId,
 			stop_sequence: someStopTimeUpdate.stop_sequence ?? null,
 			scheduleFeedDigestSlice,
 			db,
@@ -158,7 +190,10 @@ const createMatchTripUpdate = (cfg) => {
 		})
 
 		if (!isMatch(scheduleStopTimes)) {
-			logger.warn(logCtx, 'failed to find matching schedule trip for TripUpdate')
+			logger.warn(
+				logCtx,
+				'failed to find matching schedule trip for TripUpdate',
+			)
 			// todo: if trip is duplicated/added, provide TripProperties.{trip_id,start_date,start_time,shape_id}?
 			return null
 		}
@@ -170,11 +205,11 @@ const createMatchTripUpdate = (cfg) => {
 		// We want to expose trip IDs matching the GTFS Schedule data.
 		tripUpdate.trip.trip_id = tripId
 
-		tripUpdate.trip.schedule_relationship = ScheduleRelationship.SCHEDULED
+		tripUpdate.trip.schedule_relationship = TripScheduleRelationship.SCHEDULED
 
 		let prevScheduleStopTimesIdx = -1
-		for (let i = 0; i < tripUpdate.stop_time_update.length; i++) {
-			const stopTimeUpdate = tripUpdate.stop_time_update[i]
+		for (let i = 0; i < stopTimeUpdates.length; i++) {
+			const stopTimeUpdate = stopTimeUpdates[i]
 			const {
 				stop_id: stopId,
 				stop_sequence: stopSequence = null,
@@ -202,9 +237,9 @@ const createMatchTripUpdate = (cfg) => {
 				// > The values must increase along the trip but do not need to be consecutive.
 				// todo: Does this mean that, in order to support additional (realtime) StopTimeUpdates in between, I *have to* use non-consecutive values in the Schedule feed?
 				if (
-					sT.stop_sequence !== null
-					&& stopSequence !== null
-					&& sT.stop_sequence !== stopSequence
+					sT.stop_sequence !== null &&
+					stopSequence !== null &&
+					sT.stop_sequence !== stopSequence
 				) {
 					return false
 				}
@@ -217,7 +252,10 @@ const createMatchTripUpdate = (cfg) => {
 					route_id,
 				})
 				// todo: set StopTimeUpdate.schedule_relationship to SKIPPED?
-				logger.warn(_logCtx, 'failed to find matching schedule stop_time for StopTimeUpdate')
+				logger.warn(
+					_logCtx,
+					'failed to find matching schedule stop_time for StopTimeUpdate',
+				)
 				continue
 			}
 			const scheduleStopTime = scheduleStopTimes[scheduleStopTimesIdx]
@@ -225,34 +263,41 @@ const createMatchTripUpdate = (cfg) => {
 				schedule_feed_digest: scheduleFeedDigestSlice,
 				route_id,
 			})
-			logger.trace({
-				..._logCtx,
-				scheduleStopTimesIdx,
-				scheduleStopTime,
-			}, 'found matching schedule stop_time for StopTimeUpdate')
+			logger.trace(
+				{
+					..._logCtx,
+					scheduleStopTimesIdx,
+					scheduleStopTime,
+				},
+				'found matching schedule stop_time for StopTimeUpdate',
+			)
 
 			stopTimeUpdate.stop_sequence = scheduleStopTime.stop_sequence
-			stopTimeUpdate.schedule_relationship = ScheduleRelationship.SCHEDULED
+			stopTimeUpdate.schedule_relationship =
+				StopTimeUpdateScheduleRelationship.SCHEDULED
 
 			// > Delay (in seconds) can be positive (meaning that the vehicle is late) or negative (meaning that the vehicle is ahead of schedule).
 			// https://gtfs.org/realtime/reference/#message-stoptimeevent
-			const getDelay = (timeAsProtobufJsLong, scheduleTimeAsIso8601) => {
-				const time = typeof timeAsProtobufJsLong === 'bigint'
-					? timeAsProtobufJsLong
-					: protobufJsLongToBigInt(timeAsProtobufJsLong)
+			const getDelay = (
+				timeAsProtobufJsLong: ProtobufLong,
+				scheduleTimeAsIso8601: string,
+			) => {
+				const time = protobufLongToBigInt(timeAsProtobufJsLong)
 				// Because `time` is a BigInt (StopTimeEvent defines it as a Protocol Buffers int64, which we parse as a BigInt), we do the entire calculation with BigInts.
-				const scheduleTime = BigInt(Math.round(Date.parse(scheduleTimeAsIso8601) / 1000))
+				const scheduleTime = BigInt(
+					Math.round(Date.parse(scheduleTimeAsIso8601) / 1000),
+				)
 				const delay = time - scheduleTime
 				// We expect the delay to be small enough to fit into a regular ECMAScript number.
 				return parseInt(delay.toString(), 10)
 			}
 			// todo: as a fallback, use `scheduleStopTime.{arrival,departure}_{time,delay}`
 			const scheduleArrival = scheduleStopTime.t_arrival
-			if (arrival && ('time' in arrival) && scheduleArrival) {
+			if (arrival?.time && scheduleArrival) {
 				arrival.delay = getDelay(arrival.time, scheduleArrival)
 			}
 			const scheduleDeparture = scheduleStopTime.t_departure
-			if (departure && ('time' in departure) && scheduleDeparture) {
+			if (departure?.time && scheduleDeparture) {
 				departure.delay = getDelay(departure.time, scheduleDeparture)
 			}
 
@@ -276,29 +321,32 @@ const createMatchTripUpdate = (cfg) => {
 
 		// fill VehicleDescriptor.id using nyctTripDescriptor.train_id
 		if (!tripUpdate.vehicle?.id && nyctTripDescriptor?.train_id) {
-			if (!tripUpdate.vehicle) {
-				tripUpdate.vehicle = {}
-			}
+			tripUpdate.vehicle ??= {}
 			tripUpdate.vehicle.id = nyctTripDescriptor?.train_id
 		}
 
 		// fill TripUpdate.delay using an upcoming arrival/departure
 		if (!('delay' in tripUpdate)) {
-			const estimation = estimateDelayFromUpcomingArrivalOrDeparture(tripUpdate, now)
+			const estimation = estimateDelayFromUpcomingArrivalOrDeparture(
+				tripUpdate,
+				now,
+			)
 			if (estimation === null) {
-				logger.info(logCtx, 'failed to find upcoming arrival/departure to use for TripUpdate.delay')
+				logger.info(
+					logCtx,
+					'failed to find upcoming arrival/departure to use for TripUpdate.delay',
+				)
 			} else {
-				const {
-					stopTimeUpdatesIdx,
-					delay,
-					kind,
-				} = estimation
-				logger.trace({
-					...logCtx,
-					stopTimeUpdatesIdx,
-					stopTimeUpdate: tripUpdate.stop_time_update[stopTimeUpdatesIdx],
-					delay,
-				}, `using upcoming ${kind} for TripUpdate.delay`)
+				const { stopTimeUpdatesIdx, delay, kind } = estimation
+				logger.trace(
+					{
+						...logCtx,
+						stopTimeUpdatesIdx,
+						stopTimeUpdate: stopTimeUpdates[stopTimeUpdatesIdx],
+						delay,
+					},
+					`using upcoming ${kind} for TripUpdate.delay`,
+				)
 				tripUpdate.delay = delay
 			}
 		}
@@ -309,6 +357,4 @@ const createMatchTripUpdate = (cfg) => {
 	}
 }
 
-export {
-	createMatchTripUpdate,
-}
+export { createMatchTripUpdate }
