@@ -38,7 +38,7 @@
 		"pg-format": "^1.0.4",
 		"pino": "10.3.1",
 		"prom-client": "^15.1.0",
-		"protobufjs": "^7.6.4",
+		"protobufjs": "^7.6.5",
 		"serve-buffer": "^3.0.3"
 	},
 	"devDependencies": {
