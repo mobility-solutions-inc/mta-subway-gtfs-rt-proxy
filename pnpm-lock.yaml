@@ -82,8 +82,8 @@ importers:
         specifier: 0.2.0
         version: 0.2.0
       protobufjs-cli:
-        specifier: ^1.1.2
-        version: 1.3.2(protobufjs@7.6.5)
+        specifier: ^1.3.3
+        version: 1.3.3(protobufjs@7.6.5)
       sample-gtfs-feed:
         specifier: 0.13.0
         version: 0.13.0
@@ -1323,8 +1323,8 @@ packages:
   prom2javascript@0.2.0:
     resolution: {integrity: sha512-NGLQ/4inw7fBuOEQBnPx8P7wUM3bHB8fm4905VPcxcyR+aIoVUo8tVpgozGZ1WaxvH+gC/PZ1CsMHXLUN5oWlw==}
 
-  protobufjs-cli@1.3.2:
-    resolution: {integrity: sha512-suTWiLuVUML04D8/uUpushosIscIiTwo657pK0yfQJP5qKIDL/ZnRVtA/2jdlNsnH6B8vZw6keL9Oo46NQlNEg==}
+  protobufjs-cli@1.3.3:
+    resolution: {integrity: sha512-zwmt6JeStPjeofZbl+QADexAVzP1EgsIAsO7mCfKkW/8oBxHwgTqJ1aD7zDrcCC0Nb+SLWSvCR3RDaKgIO3P8w==}
     engines: {node: '>=12.0.0'}
     hasBin: true
     peerDependencies:
@@ -2066,7 +2066,7 @@ snapshots:
 
   catharsis@0.9.0:
     dependencies:
-      lodash: 4.17.21
+      lodash: 4.18.1
 
   chalk@4.1.2:
     dependencies:
@@ -3018,7 +3018,7 @@ snapshots:
 
   prom2javascript@0.2.0: {}
 
-  protobufjs-cli@1.3.2(protobufjs@7.6.5):
+  protobufjs-cli@1.3.3(protobufjs@7.6.5):
     dependencies:
       chalk: 4.1.2
       escodegen: 1.14.3
@@ -3085,7 +3085,7 @@ snapshots:
 
   requizzle@0.2.4:
     dependencies:
-      lodash: 4.17.21
+      lodash: 4.18.1
 
   resolve-from@4.0.0: {}
 
