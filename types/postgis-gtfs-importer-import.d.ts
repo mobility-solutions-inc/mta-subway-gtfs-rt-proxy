@@ -21,6 +21,7 @@ export function importGtfsAtomically(cfg: {
 	pgOpts: PoolConfig
 }): Promise<{
 	downloadDurationMs: number
-	importDurationMs: number
+	newImport: SuccessfulImport | null
+	importDurationMs: number | null
 	importSkipped: boolean
 }>

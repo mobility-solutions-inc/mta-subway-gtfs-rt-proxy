@@ -94,20 +94,54 @@ const fetchImportedScheduleFeeds = async (cfg: { port: number }) => {
 	return await res.json<ImportedScheduleFeed[]>()
 }
 
+const waitForImportedScheduleFeeds = async (cfg: {
+	expectedCount: number
+	port: number
+	timeoutMs?: number
+}) => {
+	const { expectedCount, port, timeoutMs = 30_000 } = cfg
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		try {
+			const feeds = await fetchImportedScheduleFeeds({ port })
+			if (feeds.length === expectedCount) return feeds
+		} catch {
+			// The service may still be starting.
+		}
+		await new Promise((resolve) => setTimeout(resolve, 500))
+	}
+	throw new Error(
+		`timed out waiting for ${expectedCount} imported schedule feed(s)`,
+	)
+}
+
 const fetchAndParseMatchedRealtimeFeed = async (cfg: {
+	entityType?: 'trip-updates' | 'vehicle-positions'
 	port: number
 	realtimeFeedName: string
 	scheduleFeedDigest: string
 }) => {
-	const { port, realtimeFeedName, scheduleFeedDigest } = cfg
-	const url = `http://localhost:${port}/feeds/${realtimeFeedName}?schedule-feed-digest=${scheduleFeedDigest}`
-	const res = await ky(url, {
-		redirect: 'follow',
-		retry: 0,
-	})
-	const feedEncoded = Buffer.from(await res.arrayBuffer())
-	const feedMessage = FeedMessage.decode(feedEncoded)
-	return feedMessage
+	const { entityType, port, realtimeFeedName, scheduleFeedDigest } = cfg
+	const suffix = entityType ? `/${entityType}` : ''
+	const url = `http://localhost:${port}/feeds/${realtimeFeedName}${suffix}?schedule-feed-digest=${scheduleFeedDigest}`
+	const deadline = Date.now() + 10_000
+	while (true) {
+		const res = await ky(url, {
+			redirect: 'follow',
+			retry: 0,
+			throwHttpErrors: false,
+		})
+		if (res.ok) {
+			const feedEncoded = Buffer.from(await res.arrayBuffer())
+			return FeedMessage.decode(feedEncoded)
+		}
+		if (res.status !== 404 || Date.now() >= deadline) {
+			throw new Error(
+				`failed to fetch matched realtime feed: HTTP ${res.status}`,
+			)
+		}
+		await new Promise((resolve) => setTimeout(resolve, 250))
+	}
 }
 
 const fetchAndParseMetrics = async (cfg: { port: number }) => {
@@ -121,6 +155,23 @@ const fetchAndParseMetrics = async (cfg: { port: number }) => {
 		metricsEncoded[Symbol.iterator](),
 	)
 	return metrics
+}
+
+const waitForScheduleImportedMetric = async (cfg: {
+	feedName: string
+	port: number
+	value: number
+}) => {
+	const deadline = Date.now() + 10_000
+	while (true) {
+		const metrics = await fetchAndParseMetrics({ port: cfg.port })
+		const imported = metricData(metrics.schedule_feed_imported_boolean).find(
+			({ labels }) => labels.feed_name === cfg.feedName,
+		)
+		if (imported?.value === cfg.value) return metrics
+		if (Date.now() >= deadline) return metrics
+		await new Promise((resolve) => setTimeout(resolve, 250))
+	}
 }
 
 const SCHEDULE_FEED_BOOKKEEPING_DB_NAME = `test_${Math.random().toString(16).slice(2, 4)}`
@@ -312,7 +363,9 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	} = await serveFile('gtfs-rt.pb')
 	const realtimeFeedName = 'nyct_subway_1234567' // currently hard-coded by lib/feeds.js
 	env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL = `http://localhost:${realtimeFeedPort}/gtfs-rt.pb`
-	env.NYCT_SUBWAY_ACE_REALTIME_FEED_URL = '-' // disable
+	for (const name of ['ACE', 'BDFM', 'G', 'JZ', 'L', 'NQRW', 'SI']) {
+		env[`NYCT_SUBWAY_${name}_REALTIME_FEED_URL`] = '-'
+	}
 
 	// Both the success as well as the failure metrics each have several variants, for example one for each matching method. Currently, we only assert that there are more successes for a specific matching method than all failures (of that schedule feed digest & route_id) combined.
 	// todo: assert more specifically?
@@ -361,9 +414,11 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	const pTest = (async () => {
 		// check matching with FOO_FEED
 		// todo: get notified about schedule re-import instead of waiting
-		await new Promise((r) => setTimeout(r, 3_000)) // wait for Schedule feed to be imported
 		{
-			const importedScheduleFeeds = await fetchImportedScheduleFeeds({ port })
+			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
+				expectedCount: 1,
+				port,
+			})
 			strictEqual(
 				importedScheduleFeeds.length,
 				1,
@@ -372,6 +427,21 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			const importedFoo = importedScheduleFeeds[0]
 			ok(importedFoo, 'set of imported Schedule feeds should include FOO_FEED')
 			scheduleFeedDigest = importedFoo.scheduleFeedDigest
+
+			const scheduleFeeds = await ky(
+				`http://localhost:${port}/schedule-feeds`,
+			).json<{
+				latestScheduleFeedDigest: string
+				scheduleFeeds: { feedDigest: string }[]
+			}>()
+			strictEqual(scheduleFeeds.latestScheduleFeedDigest, scheduleFeedDigest)
+			strictEqual(scheduleFeeds.scheduleFeeds.length, 1)
+			const archivedZip = Buffer.from(
+				await ky(
+					`http://localhost:${port}/schedule-feeds/${scheduleFeedDigest}`,
+				).arrayBuffer(),
+			)
+			strictEqual(archivedZip.equals(FOO_FEED), true)
 
 			const { entity: feedEntities } = await fetchAndParseMatchedRealtimeFeed({
 				port,
@@ -399,6 +469,24 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				FOO_TRIP_ID_PREFIX,
 				`VehiclePosition's (feedMessage.entity[1].vehicle) trip_id should begin with "${FOO_TRIP_ID_PREFIX}"`,
 			)
+			const { entity: tripUpdateEntities } =
+				await fetchAndParseMatchedRealtimeFeed({
+					entityType: 'trip-updates',
+					port,
+					realtimeFeedName,
+					scheduleFeedDigest,
+				})
+			strictEqual(tripUpdateEntities.length, 1)
+			ok(tripUpdateEntities[0]?.trip_update)
+			const { entity: vehiclePositionEntities } =
+				await fetchAndParseMatchedRealtimeFeed({
+					entityType: 'vehicle-positions',
+					port,
+					realtimeFeedName,
+					scheduleFeedDigest,
+				})
+			strictEqual(vehiclePositionEntities.length, 1)
+			ok(vehiclePositionEntities[0]?.vehicle)
 			console.info(
 				'Realtime feed (feedMessage0) matched against FOO_FEED looks good ✔︎',
 			)
@@ -431,10 +519,11 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		// check matching with BAR_FEED
 		const fooScheduleFeedDigest = scheduleFeedDigest
 		setScheduleFeed(BAR_FEED)
-		// todo: trigger & get notified about schedule re-import instead of waiting
-		await new Promise((r) => setTimeout(r, 6_000 + 3_000)) // wait for Schedule feed to be (re-)imported
 		{
-			const importedScheduleFeeds = await fetchImportedScheduleFeeds({ port })
+			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
+				expectedCount: 2,
+				port,
+			})
 			strictEqual(
 				importedScheduleFeeds.length,
 				2,
@@ -532,8 +621,10 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				'Realtime feed (feedMessage1) matched against BAR_FEED looks good ✔︎',
 			)
 
-			const metrics = await fetchAndParseMetrics({
+			const metrics = await waitForScheduleImportedMetric({
+				feedName: scheduleFeedName,
 				port: metricsPort,
+				value: 0,
 			})
 			debugLogMatchingMetrics(metrics)
 

@@ -61,7 +61,7 @@ Because we also _cannot_ coordinate when both this service _and its consumers_ s
 
 However, **a Realtime feed is only ever compatible with _one_ Schedule feed _version_**, because the agency/route/trip IDs need to match. This is why we also **support multiple _versions_ of the Schedule feed simultaneously**, allowing each consumer's instance to request the Realtime feed it can process.
 
-With `sv` being the number of imported Schedule feed _versions_, we end up with `1 * sv * r` Realtime feeds. In practice, we keep at most 4 _versions_ imported.
+With `sv` being the number of imported Schedule feed _versions_, we end up with `1 * sv * r` Realtime feeds. The latest version is always retained. Versions requested by a consumer are retained for 24 hours after their most recent request, while superseded unused versions are removed.
 
 By letting consumers send the _digest_ (a.k.a. [hash](https://en.wikipedia.org/wiki/Hash_function)) of the Schedule feed _version_ they're using (as a query parameter, see the _API_ section), we respond to them with the corresponding _matched_ Realtime feed. This opens a large period of time where consumers can switch (the) Schedule feed _version(s)_ according to their operational requirements.
 
@@ -76,6 +76,24 @@ pnpm run build
 ```
 
 ## Usage
+
+### HTTP API
+
+- `GET /schedule-feeds` lists archived schedule versions and identifies the
+  latest successfully imported digest.
+- `GET /schedule-feeds/:digest` downloads the exact supplemented GTFS ZIP for
+  that digest and renews its retention lease.
+- `GET /feeds/:feed?schedule-feed-digest=:digest` serves a combined normalized
+  GTFS-Realtime feed.
+- `GET /feeds/:feed/trip-updates?schedule-feed-digest=:digest` and
+  `GET /feeds/:feed/vehicle-positions?schedule-feed-digest=:digest` serve the
+  entity-specific feeds used by OpenTripPlanner.
+- `GET /health` and `GET /ready` expose health and startup readiness.
+
+The service checks the MTA supplemented schedule every 15 minutes and imports
+only changed content. It always retains the latest digest and retains requested
+digests for 24 hours after their most recent request, allowing a running or
+recently rolled-back OTP graph to continue receiving matching realtime data.
 
 > [!IMPORTANT]
 > By accessing the MTA feeds, you agree to [their terms and conditions](https://new.mta.info/developers/terms-and-conditions).

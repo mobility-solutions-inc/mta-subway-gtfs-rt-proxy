@@ -2,6 +2,7 @@ import { ok } from 'node:assert'
 import { createServer as createHttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
+import type { FeedEntityType } from './lib/serve-gtfs-rt.js'
 import type {
 	HttpRequest,
 	HttpResponse,
@@ -16,6 +17,12 @@ import {
 	queryImportedScheduleFeedVersions,
 	startRefreshingScheduleFeed,
 } from './lib/refresh-schedule-feeds.js'
+import {
+	closeScheduleFeedStore,
+	getScheduleFeedArchive,
+	listScheduleFeedArchives,
+	markScheduleFeedRequested,
+} from './lib/schedule-feed-store.js'
 import { serveFeed } from './lib/serve-gtfs-rt.js'
 
 const SERVICE_LOG_LEVEL = process.env.LOG_LEVEL_SERVICE ?? 'info'
@@ -25,7 +32,11 @@ interface CreateServiceOptions {
 }
 
 interface FeedHandler {
-	serveFeed: (req: HttpRequest, res: HttpResponse) => void
+	serveFeed: (
+		req: HttpRequest,
+		res: HttpResponse,
+		entityType?: FeedEntityType | null,
+	) => void
 	stop: () => void
 }
 
@@ -263,10 +274,11 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 	const {
 		checkIfHealthy: checkIfScheduleFeedRefreshIsHealthy,
 		checkIfReady: checkIfScheduleFeedRefreshIsReady,
+		stopRefreshing: stopRefreshingScheduleFeed,
 	} = startRefreshingScheduleFeed({
 		scheduleFeedName,
 		scheduleFeedUrl,
-		onImportDone: ({ currentDatabases: _currentDatabases }) => {
+		onImportDone: async ({ currentDatabases: _currentDatabases }) => {
 			currentDatabases = _currentDatabases
 			logger.trace(
 				logCtx,
@@ -296,7 +308,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 						logCtx,
 						`adding handlers for new schedule feed version with digest "${scheduleFeedDigest}"`,
 					)
-					void addScheduleFeedVersion(scheduleFeedDigest, scheduleDatabaseName)
+					await addScheduleFeedVersion(scheduleFeedDigest, scheduleDatabaseName)
 				}
 			}
 		},
@@ -346,10 +358,23 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			return
 		}
 
-		// /feeds/:realtimeFeedName?schedule-feed-digest
+		// /feeds/:realtimeFeedName[/:entityType]?schedule-feed-digest
 		// todo: use express for routing?
-		if (pathComponents[0] === 'feeds' && pathComponents.length === 2) {
+		if (
+			pathComponents[0] === 'feeds' &&
+			(pathComponents.length === 2 || pathComponents.length === 3)
+		) {
 			const realtimeFeedName = pathComponents[1]
+			const entityType = pathComponents[2] ?? null
+			if (
+				entityType !== null &&
+				entityType !== 'trip-updates' &&
+				entityType !== 'vehicle-positions'
+			) {
+				res.statusCode = 404
+				res.end('invalid realtime entity type')
+				return
+			}
 			if (!realtimeFetchersByName.has(realtimeFeedName)) {
 				res.statusCode = 404
 				res.end('invalid realtime feed name')
@@ -372,7 +397,71 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			const { feedHandlers } =
 				feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)!
 			const { serveFeed } = feedHandlers.get(realtimeFeedName)!
-			serveFeed(req, res)
+			void (async () => {
+				const marked = await markScheduleFeedRequested(scheduleFeedDigest)
+				if (!marked) {
+					logger.warn(
+						{ scheduleFeedDigest },
+						'schedule feed digest has no archived ZIP',
+					)
+				}
+				serveFeed(req, res, entityType)
+			})().catch((error: unknown) => {
+				logger.warn(
+					{ error, scheduleFeedDigest },
+					'failed to renew schedule feed lease',
+				)
+				res.statusCode = 503
+				res.end('failed to renew schedule feed lease')
+			})
+			return
+		}
+
+		if (pathComponents[0] === 'schedule-feeds' && pathComponents.length === 1) {
+			void (async () => {
+				const archives = await listScheduleFeedArchives()
+				res.setHeader('content-type', 'application/json')
+				res.end(
+					JSON.stringify({
+						latestScheduleFeedDigest: archives[0]?.feedDigest ?? null,
+						scheduleFeeds: archives,
+					}),
+				)
+			})().catch((error: unknown) => {
+				logger.warn({ error }, 'failed to list archived schedule feeds')
+				res.statusCode = 503
+				res.end('failed to list schedule feeds')
+			})
+			return
+		}
+
+		if (pathComponents[0] === 'schedule-feeds' && pathComponents.length === 2) {
+			const scheduleFeedDigest = pathComponents[1]
+			void (async () => {
+				const archive = await getScheduleFeedArchive(scheduleFeedDigest)
+				if (archive === null) {
+					res.statusCode = 404
+					res.end('invalid/unknown schedule-feed-digest')
+					return
+				}
+				res.setHeader('content-type', 'application/zip')
+				res.setHeader(
+					'content-disposition',
+					`attachment; filename="nyct-subway-${scheduleFeedDigest}.zip"`,
+				)
+				if (archive.etag) res.setHeader('etag', archive.etag)
+				if (archive.lastModified) {
+					res.setHeader('last-modified', archive.lastModified)
+				}
+				res.end(archive.feedZip)
+			})().catch((error: unknown) => {
+				logger.warn(
+					{ error, scheduleFeedDigest },
+					'failed to serve archived schedule feed',
+				)
+				res.statusCode = 503
+				res.end('failed to serve schedule feed')
+			})
 			return
 		}
 
@@ -441,6 +530,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 	)
 
 	const stopService = async () => {
+		stopRefreshingScheduleFeed()
 		// todo: info-log
 		for (const { abortFetching } of realtimeFetchersByName.values()) {
 			abortFetching()
@@ -450,6 +540,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 		} of feedHandlersByScheduleFeedDigest.values()) {
 			await closeConnections()
 		}
+		await closeScheduleFeedStore()
 		server.close()
 	}
 

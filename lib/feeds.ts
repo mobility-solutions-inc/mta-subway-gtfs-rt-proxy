@@ -21,37 +21,37 @@ interface ScheduleFeedConfig {
 const NYCT_SUBWAY_FEED_NAME = 'nyct_subway'
 const NYCT_SUBWAY_SCHEDULE_FEED_URL =
 	process.env.NYCT_SUBWAY_SCHEDULE_FEED_URL ??
-	'http://web.mta.info/developers/files/google_transit_supplemented.zip'
+	'https://rrgtfsfeeds.s3.amazonaws.com/gtfs_supplemented.zip'
 
-let NYCT_SUBWAY_1234567_REALTIME_FEED_URL: string | null =
-	process.env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL ??
-	'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs'
-if (NYCT_SUBWAY_1234567_REALTIME_FEED_URL === '-') {
-	NYCT_SUBWAY_1234567_REALTIME_FEED_URL = null
-}
-let NYCT_SUBWAY_ACE_REALTIME_FEED_URL: string | null =
-	process.env.NYCT_SUBWAY_ACE_REALTIME_FEED_URL ??
-	'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace'
-if (NYCT_SUBWAY_ACE_REALTIME_FEED_URL === '-') {
-	NYCT_SUBWAY_ACE_REALTIME_FEED_URL = null
+const realtimeFeed = (
+	name: string,
+	envName: string,
+	upstreamName: string,
+): RealtimeFeedConfig | null => {
+	const configured =
+		process.env[envName] ??
+		`https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2F${upstreamName}`
+	if (configured === '-') return null
+	return {
+		realtimeFeedName: `nyct_subway_${name}`,
+		realtimeFeedUrl: configured,
+		realtimeFeedApiKey: MTA_API_ACCESS_KEY,
+	}
 }
 
 const NYCT_SUBWAY_FEED: ScheduleFeedConfig = {
 	scheduleFeedName: NYCT_SUBWAY_FEED_NAME,
 	scheduleFeedUrl: NYCT_SUBWAY_SCHEDULE_FEED_URL,
 	realtimeFeeds: [
-		{
-			realtimeFeedName: 'nyct_subway_1234567',
-			realtimeFeedUrl: NYCT_SUBWAY_1234567_REALTIME_FEED_URL,
-			realtimeFeedApiKey: MTA_API_ACCESS_KEY,
-		},
-		{
-			realtimeFeedName: 'nyct_subway_ace',
-			realtimeFeedUrl: NYCT_SUBWAY_ACE_REALTIME_FEED_URL,
-			realtimeFeedApiKey: MTA_API_ACCESS_KEY,
-		},
-		// todo: add the missing ones
-	].filter((feed): feed is RealtimeFeedConfig => feed.realtimeFeedUrl !== null),
+		realtimeFeed('1234567', 'NYCT_SUBWAY_1234567_REALTIME_FEED_URL', 'gtfs'),
+		realtimeFeed('ace', 'NYCT_SUBWAY_ACE_REALTIME_FEED_URL', 'gtfs-ace'),
+		realtimeFeed('bdfm', 'NYCT_SUBWAY_BDFM_REALTIME_FEED_URL', 'gtfs-bdfm'),
+		realtimeFeed('g', 'NYCT_SUBWAY_G_REALTIME_FEED_URL', 'gtfs-g'),
+		realtimeFeed('jz', 'NYCT_SUBWAY_JZ_REALTIME_FEED_URL', 'gtfs-jz'),
+		realtimeFeed('l', 'NYCT_SUBWAY_L_REALTIME_FEED_URL', 'gtfs-l'),
+		realtimeFeed('nqrw', 'NYCT_SUBWAY_NQRW_REALTIME_FEED_URL', 'gtfs-nqrw'),
+		realtimeFeed('si', 'NYCT_SUBWAY_SI_REALTIME_FEED_URL', 'gtfs-si'),
+	].filter((feed): feed is RealtimeFeedConfig => feed !== null),
 }
 
 const ALL_FEEDS: ScheduleFeedConfig[] = [
