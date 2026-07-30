@@ -1,6 +1,7 @@
 import { ok } from 'node:assert'
 import { createServer as createHttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { Counter } from 'prom-client'
 
 import type { FeedEntityType } from './lib/serve-gtfs-rt.js'
 import type {
@@ -8,11 +9,15 @@ import type {
 	HttpResponse,
 	ScheduleFeedDatabase,
 } from './lib/types.js'
+import { publishCloudWatchMetrics } from './lib/cloudwatch-metrics.js'
 import { ALL_FEEDS } from './lib/feeds.js'
 import { startFetchingRealtimeFeed } from './lib/fetch-realtime-feed.js'
 import { createLogger } from './lib/logger.js'
 import { createParseAndProcessFeed } from './lib/match.js'
-import { createMetricsServer } from './lib/metrics.js'
+import {
+	createMetricsServer,
+	register as metricsRegister,
+} from './lib/metrics.js'
 import {
 	queryImportedScheduleFeedVersions,
 	startRefreshingScheduleFeed,
@@ -26,6 +31,13 @@ import {
 import { serveFeed } from './lib/serve-gtfs-rt.js'
 
 const SERVICE_LOG_LEVEL = process.env.LOG_LEVEL_SERVICE ?? 'info'
+
+const unavailableScheduleFeedRequests = new Counter({
+	name: 'schedule_feed_unavailable_digest_requests_total',
+	help: 'number of requests for a schedule feed digest that is unavailable',
+	labelNames: ['endpoint'],
+	registers: [metricsRegister],
+})
 
 interface CreateServiceOptions {
 	port?: number
@@ -388,23 +400,31 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			}
 			const scheduleFeedDigest = url.searchParams.get('schedule-feed-digest')
 			ok(scheduleFeedDigest, 'missing schedule-feed-digest parameter')
-			if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
-				res.statusCode = 404
-				res.end('invalid/unknown schedule-feed-digest')
-				return
-			}
-
-			const { feedHandlers } =
-				feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)!
-			const { serveFeed } = feedHandlers.get(realtimeFeedName)!
 			void (async () => {
 				const marked = await markScheduleFeedRequested(scheduleFeedDigest)
 				if (!marked) {
-					logger.warn(
-						{ scheduleFeedDigest },
-						'schedule feed digest has no archived ZIP',
-					)
+					unavailableScheduleFeedRequests.inc({ endpoint: 'realtime' })
+					await publishCloudWatchMetrics([
+						{
+							MetricName: 'UnavailableDigestRequests',
+							Unit: 'Count',
+							Value: 1,
+						},
+					])
+					res.statusCode = 404
+					res.end('invalid/unknown schedule-feed-digest')
+					return
 				}
+				const handlers =
+					feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
+				if (!handlers) {
+					res.statusCode = 503
+					res.end('schedule feed digest is not ready')
+					return
+				}
+				const feedHandler = handlers.feedHandlers.get(realtimeFeedName)
+				ok(feedHandler, 'missing realtime feed handler')
+				const { serveFeed } = feedHandler
 				serveFeed(req, res, entityType)
 			})().catch((error: unknown) => {
 				logger.warn(
@@ -440,6 +460,14 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			void (async () => {
 				const archive = await getScheduleFeedArchive(scheduleFeedDigest)
 				if (archive === null) {
+					unavailableScheduleFeedRequests.inc({ endpoint: 'archive' })
+					void publishCloudWatchMetrics([
+						{
+							MetricName: 'UnavailableDigestRequests',
+							Unit: 'Count',
+							Value: 1,
+						},
+					])
 					res.statusCode = 404
 					res.end('invalid/unknown schedule-feed-digest')
 					return
@@ -462,6 +490,12 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 				res.statusCode = 503
 				res.end('failed to serve schedule feed')
 			})
+			return
+		}
+
+		if (pathComponents[0] === 'live' && pathComponents.length === 1) {
+			res.statusCode = 200
+			res.end('')
 			return
 		}
 

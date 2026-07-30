@@ -10,15 +10,22 @@ import pgFormat from 'pg-format'
 import { Counter, Gauge, Summary } from 'prom-client'
 
 import type { ScheduleFeedDatabase } from './types.js'
+import {
+	feedNameDimension,
+	publishCloudWatchMetrics,
+} from './cloudwatch-metrics.js'
 import { connectToPostgres, getPgOpts } from './db.js'
 import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
 import {
 	deleteScheduleFeedArchive,
 	ensureScheduleFeedStore,
+	getLatestScheduleFeedCheck,
 	getScheduleFeedValidators,
-	queryRetainedScheduleFeedDigests,
+	isScheduleFeedDigestRetained,
+	markLatestScheduleFeedChecked,
 	storeScheduleFeedArchive,
+	withScheduleFeedDigestLock,
 } from './schedule-feed-store.js'
 
 const require = createRequire(import.meta.url)
@@ -216,27 +223,35 @@ const pruneScheduleFeedVersions = async (scheduleFeedName: string) => {
 	const [latest] = current
 	if (!latest) return current
 
-	const retainedDigests = await queryRetainedScheduleFeedDigests(
-		latest.feedDigest,
-	)
 	const obsolete = current.filter(
-		({ feedDigest }) => !retainedDigests.has(feedDigest),
+		({ feedDigest }) => feedDigest !== latest.feedDigest,
 	)
 	if (obsolete.length === 0) return current
 
 	const db = await connectToPostgres()
 	try {
 		for (const { feedDigest, name } of obsolete) {
-			scheduleLogger.info(
-				{ feedDigest, scheduleDatabaseName: name },
-				'pruning unleased schedule feed version',
-			)
-			await db.query(pgFormat('DROP DATABASE %I WITH (FORCE)', name))
-			await db.query(
-				'DELETE FROM latest_successful_imports WHERE db_name = $1',
-				[name],
-			)
-			await deleteScheduleFeedArchive(feedDigest)
+			await withScheduleFeedDigestLock(db, feedDigest, async (client) => {
+				if (
+					await isScheduleFeedDigestRetained(
+						client,
+						feedDigest,
+						latest.feedDigest,
+					)
+				) {
+					return
+				}
+				scheduleLogger.info(
+					{ feedDigest, scheduleDatabaseName: name },
+					'pruning unleased schedule feed version',
+				)
+				await client.query(pgFormat('DROP DATABASE %I WITH (FORCE)', name))
+				await client.query(
+					'DELETE FROM latest_successful_imports WHERE db_name = $1',
+					[name],
+				)
+				await deleteScheduleFeedArchive(feedDigest, client)
+			})
 		}
 	} finally {
 		await db.end()
@@ -272,7 +287,14 @@ const startRefreshingScheduleFeed = (
 		})
 		if (existing.length > 0) {
 			isReady = true
-			lastSuccessfulCheckAt = Date.now()
+			const persistedLastCheck = await getLatestScheduleFeedCheck()
+			lastSuccessfulCheckAt = persistedLastCheck?.getTime() ?? 0
+			if (lastSuccessfulCheckAt > 0) {
+				scheduleFeedLastCheckedTimestamp.set(
+					{ feed_name: scheduleFeedName },
+					lastSuccessfulCheckAt / 1000,
+				)
+			}
 			await onImportDone({ currentDatabases: existing })
 		}
 
@@ -319,17 +341,61 @@ const startRefreshingScheduleFeed = (
 				} else {
 					dataImported.set({ feed_name: scheduleFeedName }, 0)
 					currentDatabases = await pruneScheduleFeedVersions(scheduleFeedName)
+					const checkedAt = await markLatestScheduleFeedChecked()
+					ok(
+						checkedAt,
+						'unchanged schedule feed has no archived successful version',
+					)
+					lastSuccessfulCheckAt = checkedAt.getTime()
 				}
 
-				lastSuccessfulCheckAt = Date.now()
+				if (download.changed) {
+					const persistedLastCheck = await getLatestScheduleFeedCheck()
+					ok(
+						persistedLastCheck,
+						'imported schedule feed has no check timestamp',
+					)
+					lastSuccessfulCheckAt = persistedLastCheck.getTime()
+				}
 				scheduleFeedLastCheckedTimestamp.set(
 					{ feed_name: scheduleFeedName },
 					lastSuccessfulCheckAt / 1000,
 				)
+				await publishCloudWatchMetrics([
+					{
+						MetricName: 'ScheduleRefreshSuccess',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Count',
+						Value: 1,
+					},
+					{
+						MetricName: 'ScheduleAgeSeconds',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Seconds',
+						Value: Math.max(0, (Date.now() - lastSuccessfulCheckAt) / 1000),
+					},
+				])
 				isReady = currentDatabases.length > 0
 				await onImportDone({ currentDatabases })
 			} catch (error) {
 				scheduleFeedRefreshFailures.inc({ feed_name: scheduleFeedName })
+				await publishCloudWatchMetrics([
+					{
+						MetricName: 'ScheduleRefreshSuccess',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Count',
+						Value: 0,
+					},
+					{
+						MetricName: 'ScheduleAgeSeconds',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Seconds',
+						Value:
+							lastSuccessfulCheckAt > 0
+								? (Date.now() - lastSuccessfulCheckAt) / 1000
+								: STALE_AFTER_MS / 1000 + 1,
+					},
+				])
 				scheduleLogger.error(
 					{ error, scheduleFeedName },
 					'failed to refresh GTFS Schedule feed; retaining last successful version',

@@ -6,6 +6,10 @@ import { createRequire } from 'node:module'
 import ky from 'ky'
 import { Counter, Gauge, Summary } from 'prom-client'
 
+import {
+	feedNameDimension,
+	publishCloudWatchMetrics,
+} from './cloudwatch-metrics.js'
 import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
 
@@ -79,6 +83,8 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 	}
 
 	const events: RealtimeFeedEvents = new EventEmitter()
+	const startedFetchingAt = Date.now()
+	let lastSuccessfulFetchAt = 0
 
 	const fetchRealtimeFeed = async () => {
 		logger.trace(logCtx, 'fetching GTFS Realtime feed')
@@ -127,6 +133,15 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 			{ feed_name: realtimeFeedName },
 			Date.now() / 1000,
 		)
+		lastSuccessfulFetchAt = Date.now()
+		await publishCloudWatchMetrics([
+			{
+				MetricName: 'RealtimeFeedAgeSeconds',
+				Dimensions: feedNameDimension(realtimeFeedName),
+				Unit: 'Seconds',
+				Value: 0,
+			},
+		])
 
 		// todo: expose last-modified header, fall back to Date.now()
 		events.emit('update', { feedEncoded })
@@ -149,6 +164,16 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 				fetchDurationMs = _fetchDurationMs
 			} catch (err) {
 				realtimeFeedFetchFailures.inc({ feed_name: realtimeFeedName })
+				await publishCloudWatchMetrics([
+					{
+						MetricName: 'RealtimeFeedAgeSeconds',
+						Dimensions: feedNameDimension(realtimeFeedName),
+						Unit: 'Seconds',
+						Value:
+							(Date.now() - (lastSuccessfulFetchAt || startedFetchingAt)) /
+							1000,
+					},
+				])
 				logger.warn(
 					{
 						...logCtx,

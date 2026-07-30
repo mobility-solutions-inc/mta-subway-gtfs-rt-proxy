@@ -36,8 +36,11 @@ const BAR_FEED = readFileSync(
 
 const serveFile = async (filename: string) => {
 	let file: Buffer | null = null
+	let version = 0
+	let notModifiedRequests = 0
 	const setFile = (newFile: Buffer) => {
 		file = newFile
+		version++
 	}
 	const serveFile = (
 		req: IncomingMessage,
@@ -45,6 +48,13 @@ const serveFile = async (filename: string) => {
 	) => {
 		const { pathname } = new URL(req.url ?? '/', 'http://example.org')
 		if (pathname === '/' + filename && file !== null) {
+			const etag = `"${filename}-${version}"`
+			res.setHeader('etag', etag)
+			if (req.headers['if-none-match'] === etag) {
+				notModifiedRequests++
+				res.writeHead(304).end()
+				return
+			}
 			res.end(file)
 		} else {
 			res.writeHead(404).end()
@@ -64,6 +74,7 @@ const serveFile = async (filename: string) => {
 		'test file server must listen on a TCP port',
 	)
 	return {
+		getNotModifiedRequestCount: () => notModifiedRequests,
 		port: address.port,
 		stop: async () => {
 			await new Promise<void>((resolve, reject) => {
@@ -342,14 +353,16 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		METRICS_SERVER_PORT: String(metricsPort),
 		PGDATABASE: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
 		SCHEDULE_FEED_DB_NAME_PREFIX,
-		SCHEDULE_FEED_REFRESH_INTERVAL: '6', // seconds
-		SCHEDULE_FEED_REFRESH_MIN_INTERVAL: '6', // seconds
+		SCHEDULE_FEED_REFRESH_INTERVAL: '3', // seconds
+		SCHEDULE_FEED_REFRESH_MIN_INTERVAL: '3', // seconds
+		SCHEDULE_FEED_USED_RETENTION: '8', // seconds
 		REALTIME_FEED_FETCH_INTERVAL: '1', // seconds
 		REALTIME_FEED_FETCH_MIN_INTERVAL: '1', // seconds
 	}
 
 	const {
 		port: scheduleFeedPort,
+		getNotModifiedRequestCount,
 		stop: stopServingScheduleFeed,
 		setFile: setScheduleFeed,
 	} = await serveFile('gtfs.zip')
@@ -591,6 +604,26 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			)
 		}
 
+		const feedsAfterLeaseExpiry = await waitForImportedScheduleFeeds({
+			expectedCount: 1,
+			port,
+			timeoutMs: 20_000,
+		})
+		strictEqual(
+			feedsAfterLeaseExpiry[0]?.scheduleFeedDigest,
+			scheduleFeedDigest,
+			'latest BAR schedule must remain after the prior FOO lease expires',
+		)
+		const expiredArchiveResponse = await ky(
+			`http://localhost:${port}/schedule-feeds/${fooScheduleFeedDigest}`,
+			{ throwHttpErrors: false },
+		)
+		strictEqual(
+			expiredArchiveResponse.status,
+			404,
+			'expired prior digest archive should be pruned',
+		)
+
 		// modify realtime feed, check matching with BAR_FEED again
 		setRealtimeFeed(encodeFeedMessage(feedMessage1))
 		// todo: trigger & get notified about realtime fetching instead of waiting
@@ -636,6 +669,10 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				scheduleFeedImported?.value,
 				0,
 				'schedule_feed_imported_boolean should be 0',
+			)
+			ok(
+				getNotModifiedRequestCount() > 0,
+				'unchanged schedule requests should use conditional HTTP and receive 304',
 			)
 
 			checkTripUpdatesMatchingSuccessesAndFailures(

@@ -29,6 +29,7 @@
 		"node": ">=24"
 	},
 	"dependencies": {
+		"@aws-sdk/client-cloudwatch": "^3.1098.0",
 		"etag": "^1.8.1",
 		"ky": "2.0.2",
 		"lodash": "^4.18.1",
