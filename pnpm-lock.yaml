@@ -82,7 +82,7 @@ importers:
         specifier: 0.2.0
         version: 0.2.0
       protobufjs-cli:
-        specifier: ^2.6.1
+        specifier: 2.6.1
         version: 2.6.1(protobufjs@8.7.1)
       sample-gtfs-feed:
         specifier: 0.13.0
