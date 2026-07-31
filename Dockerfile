@@ -31,14 +31,14 @@ WORKDIR /app
 RUN corepack enable
 
 # install tools
-# - bash, ncurses (tput), moreutils (sponge), postgresql-client (psql), unzip & zstd are required by postgis-gtfs-importer.
+# - bash, ncurses (tput), moreutils (sponge), PostgreSQL 18's psql, unzip & zstd are required by postgis-gtfs-importer.
 # - curl is required by curl-mirror, which is required by postgis-gtfs-importer.
 RUN apk add --update --no-cache \
 	bash \
 	curl \
 	ncurses \
 	moreutils \
-	postgresql-client \
+	postgresql18-client \
 	unzip \
 	zstd
 COPY --from=builder /app/curl-mirror.mjs ./

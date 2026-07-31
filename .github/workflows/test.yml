@@ -66,7 +66,7 @@ jobs:
         run: |
           docker run -d -q \
             -e POSTGRES_USER=$PGUSER -e POSTGRES_PASSWORD=$PGPASSWORD -e POSTGRES_DB=$PGDATABASE \
-            -p 5432:5432 postgis/postgis:14-3.4-alpine
+            -p 5432:5432 postgis/postgis:17-3.5-alpine@sha256:2db2d29dbde9379103076851c39f50f4fd9c7ee4297251ed006ed94d586df958
         env:
           PGUSER: postgres
           PGPASSWORD: password
