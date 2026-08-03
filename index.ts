@@ -21,8 +21,9 @@ import {
 	createMetricsServer,
 	register as metricsRegister,
 } from './lib/metrics.js'
+import { protobufLongToNumber } from './lib/protobuf.js'
 import {
-	queryImportedScheduleFeedVersions,
+	pruneScheduleFeedVersions,
 	startRefreshingScheduleFeed,
 } from './lib/refresh-schedule-feeds.js'
 import {
@@ -58,6 +59,7 @@ interface FeedHandler {
 interface ScheduleFeedHandlers {
 	checkIfHealthy: () => Promise<boolean>
 	closeConnections: () => Promise<void>
+	databaseName: string
 	feedHandlers: Map<string, FeedHandler>
 }
 
@@ -209,12 +211,17 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 							)
 							setFeedMessage(feedMessage)
 							lastSuccessfulProcessingAt = Date.now()
+							const sourceTimestamp = feedMessage.header.timestamp
+							const sourceTimestampMs =
+								sourceTimestamp === undefined || sourceTimestamp === null
+									? lastSuccessfulProcessingAt
+									: protobufLongToNumber(sourceTimestamp) * 1000
 							await publishCloudWatchMetrics([
 								{
 									MetricName: 'RealtimeFeedAgeSeconds',
 									Dimensions: feedNameDimension(realtimeFeedName),
 									Unit: 'Seconds',
-									Value: 0,
+									Value: Math.max(0, (Date.now() - sourceTimestampMs) / 1000),
 								},
 							])
 							logger.debug(
@@ -285,6 +292,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			feedHandlers,
 			closeConnections: stopMatchingRealtimeFeed,
 			checkIfHealthy: checkIfMatcherIsHealthy,
+			databaseName: scheduleDatabaseName,
 		})
 	}
 
@@ -318,9 +326,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 
 	let currentDatabases: ScheduleFeedDatabase[] = []
 	{
-		currentDatabases = await queryImportedScheduleFeedVersions({
-			scheduleFeedName,
-		})
+		currentDatabases = await pruneScheduleFeedVersions(scheduleFeedName)
 		// todo: do this in parallel?
 		for (const { name, feedDigest } of currentDatabases) {
 			logger.trace(
@@ -363,6 +369,23 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			for (const newScheduleFeedVersion of currentDatabases) {
 				const { name: scheduleDatabaseName, feedDigest: scheduleFeedDigest } =
 					newScheduleFeedVersion
+				const existingHandlers =
+					feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
+				if (
+					existingHandlers &&
+					existingHandlers.databaseName !== scheduleDatabaseName
+				) {
+					logger.info(
+						{
+							...logCtx,
+							scheduleFeedDigest,
+							oldScheduleDatabaseName: existingHandlers.databaseName,
+							scheduleDatabaseName,
+						},
+						'replacing matcher after a digest was re-imported',
+					)
+					removeScheduleFeedVersion(scheduleFeedDigest)
+				}
 				if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
 					logger.trace(
 						logCtx,

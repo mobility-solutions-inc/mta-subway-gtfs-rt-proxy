@@ -415,6 +415,26 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	let scheduleFeedDigest = ''
 	setRealtimeFeed(encodeFeedMessage(feedMessage0))
 
+	const staleScheduleDatabaseName = `${SCHEDULE_FEED_DB_NAME_PREFIX}${scheduleFeedName}_missing`
+	{
+		const db = await connectToPostgres({
+			database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
+		})
+		await db.query(`
+			CREATE TABLE latest_successful_imports (
+				db_name TEXT PRIMARY KEY,
+				imported_at INTEGER NOT NULL,
+				feed_digest TEXT NOT NULL
+			)
+		`)
+		await db.query(
+			`INSERT INTO latest_successful_imports (db_name, imported_at, feed_digest)
+			 VALUES ($1, $2, $3)`,
+			[staleScheduleDatabaseName, 1, 'missing-digest'],
+		)
+		await promisify(db.end.bind(db))()
+	}
+
 	// todo: pass in `now`?
 	const pServiceProcess = execa(process.execPath, [PATH_TO_SERVICE], {
 		stdio: 'inherit',
@@ -440,6 +460,20 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			const importedFoo = importedScheduleFeeds[0]
 			ok(importedFoo, 'set of imported Schedule feeds should include FOO_FEED')
 			scheduleFeedDigest = importedFoo.scheduleFeedDigest
+
+			const db = await connectToPostgres({
+				database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
+			})
+			const staleImport = await db.query<{ exists: boolean }>(
+				'SELECT EXISTS (SELECT 1 FROM latest_successful_imports WHERE db_name = $1) AS exists',
+				[staleScheduleDatabaseName],
+			)
+			await promisify(db.end.bind(db))()
+			strictEqual(
+				staleImport.rows[0]?.exists,
+				false,
+				'startup should reconcile bookkeeping that points to a missing database',
+			)
 
 			const scheduleFeeds = await ky(
 				`http://localhost:${port}/schedule-feeds`,
@@ -700,6 +734,28 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			checkVehiclePositionsMatchingSuccessesAndFailures(
 				metrics,
 				'stop_times_by_suffix_stop_id_stop_seq',
+			)
+		}
+
+		// A previously seen digest can become current again. The new database must
+		// replace the old one instead of leaving an unreachable duplicate behind.
+		setScheduleFeed(FOO_FEED)
+		await waitForImportedScheduleFeeds({ expectedCount: 2, port })
+		{
+			const db = await connectToPostgres({
+				database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
+			})
+			const duplicateDigestImports = await db.query<{ count: string }>(
+				`SELECT count(*)::text AS count
+				 FROM latest_successful_imports
+				 WHERE feed_digest = $1`,
+				[fooScheduleFeedDigest],
+			)
+			await promisify(db.end.bind(db))()
+			strictEqual(
+				duplicateDigestImports.rows[0]?.count,
+				'1',
+				'a re-imported digest should have exactly one schedule database',
 			)
 		}
 

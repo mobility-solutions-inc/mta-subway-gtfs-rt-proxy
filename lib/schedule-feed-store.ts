@@ -327,6 +327,18 @@ const deleteScheduleFeedArchive = async (
 	await refreshArchiveMetrics(true)
 }
 
+const deleteScheduleFeedArchiveByDatabaseName = async (
+	dbName: string,
+	client?: Pool | PoolClient,
+) => {
+	await ensureScheduleFeedStore()
+	const db = client ?? (await getStoreDb())
+	await db.query('DELETE FROM schedule_feed_archives WHERE db_name = $1', [
+		dbName,
+	])
+	await refreshArchiveMetrics(true)
+}
+
 const markLatestScheduleFeedChecked = async () => {
 	await ensureScheduleFeedStore()
 	const db = await getStoreDb()
@@ -368,6 +380,7 @@ const closeScheduleFeedStore = async () => {
 export {
 	closeScheduleFeedStore,
 	deleteScheduleFeedArchive,
+	deleteScheduleFeedArchiveByDatabaseName,
 	ensureScheduleFeedStore,
 	getScheduleFeedArchive,
 	getLatestScheduleFeedCheck,

@@ -18,7 +18,7 @@ import { connectToPostgres, getPgOpts } from './db.js'
 import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
 import {
-	deleteScheduleFeedArchive,
+	deleteScheduleFeedArchiveByDatabaseName,
 	ensureScheduleFeedStore,
 	getLatestScheduleFeedCheck,
 	getScheduleFeedValidators,
@@ -106,15 +106,72 @@ const queryImportedScheduleFeedVersions = async (
 	ok(scheduleFeedName, 'scheduleFeedName')
 
 	const databaseNamePrefix = `${DB_NAME_PREFIX}${scheduleFeedName}_`
-	const { latestSuccessfulImports } = await queryImports({
+	await ensureScheduleFeedStore()
+	const { allDbs, latestSuccessfulImports } = await queryImports({
 		databaseNamePrefix,
 		pgOpts: getPgOpts(),
 	})
-	const currentDatabases = latestSuccessfulImports.map((_import) => ({
-		name: _import.dbName,
-		importedAt: _import.importedAt,
-		feedDigest: _import.feedDigest,
-	}))
+	const existingDatabaseNames = new Set(allDbs)
+	const staleImports = latestSuccessfulImports.filter(
+		({ dbName }) => !existingDatabaseNames.has(dbName),
+	)
+	const validImportDatabaseNames = latestSuccessfulImports
+		.filter(({ dbName }) => existingDatabaseNames.has(dbName))
+		.map(({ dbName }) => dbName)
+	const db = await connectToPostgres()
+	try {
+		const { rows: orphanedArchives } = await db.query<{
+			db_name: string
+			feed_digest: string
+		}>(
+			`
+				SELECT db_name, feed_digest
+				FROM schedule_feed_archives
+				WHERE
+					substring(db_name FOR character_length($1)) = $1
+					AND NOT (db_name = ANY($2::text[]))
+			`,
+			[databaseNamePrefix, validImportDatabaseNames],
+		)
+		const staleBookkeeping = new Map(
+			staleImports.map(({ dbName, feedDigest }) => [dbName, feedDigest]),
+		)
+		for (const {
+			db_name: dbName,
+			feed_digest: feedDigest,
+		} of orphanedArchives) {
+			staleBookkeeping.set(dbName, feedDigest)
+		}
+		if (staleBookkeeping.size > 0) {
+			try {
+				await db.query('BEGIN')
+				for (const [dbName, feedDigest] of staleBookkeeping) {
+					scheduleLogger.warn(
+						{ feedDigest, scheduleDatabaseName: dbName },
+						'removing bookkeeping for an unavailable schedule database',
+					)
+					await db.query(
+						'DELETE FROM latest_successful_imports WHERE db_name = $1',
+						[dbName],
+					)
+					await deleteScheduleFeedArchiveByDatabaseName(dbName, db)
+				}
+				await db.query('COMMIT')
+			} catch (error) {
+				await db.query('ROLLBACK')
+				throw error
+			}
+		}
+	} finally {
+		await db.end()
+	}
+	const currentDatabases = latestSuccessfulImports
+		.filter(({ dbName }) => existingDatabaseNames.has(dbName))
+		.map((_import) => ({
+			name: _import.dbName,
+			importedAt: _import.importedAt,
+			feedDigest: _import.feedDigest,
+		}))
 	noOfImportedScheduleFeeds.set(currentDatabases.length)
 	return currentDatabases
 }
@@ -225,9 +282,7 @@ const pruneScheduleFeedVersions = async (scheduleFeedName: string) => {
 	const [latest] = current
 	if (!latest) return current
 
-	const obsolete = current.filter(
-		({ feedDigest }) => feedDigest !== latest.feedDigest,
-	)
+	const obsolete = current.filter(({ name }) => name !== latest.name)
 	if (obsolete.length === 0) return current
 
 	const db = await connectToPostgres()
@@ -235,11 +290,12 @@ const pruneScheduleFeedVersions = async (scheduleFeedName: string) => {
 		for (const { feedDigest, name } of obsolete) {
 			await withScheduleFeedDigestLock(db, feedDigest, async (client) => {
 				if (
-					await isScheduleFeedDigestRetained(
+					feedDigest !== latest.feedDigest &&
+					(await isScheduleFeedDigestRetained(
 						client,
 						feedDigest,
 						latest.feedDigest,
-					)
+					))
 				) {
 					return
 				}
@@ -248,11 +304,18 @@ const pruneScheduleFeedVersions = async (scheduleFeedName: string) => {
 					'pruning unleased schedule feed version',
 				)
 				await client.query(pgFormat('DROP DATABASE %I WITH (FORCE)', name))
-				await client.query(
-					'DELETE FROM latest_successful_imports WHERE db_name = $1',
-					[name],
-				)
-				await deleteScheduleFeedArchive(feedDigest, client)
+				await client.query('BEGIN')
+				try {
+					await client.query(
+						'DELETE FROM latest_successful_imports WHERE db_name = $1',
+						[name],
+					)
+					await deleteScheduleFeedArchiveByDatabaseName(name, client)
+					await client.query('COMMIT')
+				} catch (error) {
+					await client.query('ROLLBACK')
+					throw error
+				}
 			})
 		}
 	} finally {
@@ -438,4 +501,8 @@ const startRefreshingScheduleFeed = (
 	}
 }
 
-export { queryImportedScheduleFeedVersions, startRefreshingScheduleFeed }
+export {
+	pruneScheduleFeedVersions,
+	queryImportedScheduleFeedVersions,
+	startRefreshingScheduleFeed,
+}
