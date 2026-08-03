@@ -13,6 +13,9 @@ env | grep '^PG' || true
 
 export MATCH_CONCURRENCY='1'
 
+env REALTIME_FEED_FETCH_INTERVAL='1' REALTIME_FEED_FETCH_MIN_INTERVAL='1' \
+	node --test ../dist/test/04-fetch-realtime-feed.js
+
 source 01-match-prepare.sh 'test_mta_2024_03_18'
 env PGDATABASE=test_mta_2024_03_18 \
 	node --test ../dist/test/01-match.js

@@ -6,10 +6,6 @@ import { createRequire } from 'node:module'
 import ky from 'ky'
 import { Counter, Gauge, Summary } from 'prom-client'
 
-import {
-	feedNameDimension,
-	publishCloudWatchMetrics,
-} from './cloudwatch-metrics.js'
 import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
 
@@ -61,7 +57,6 @@ interface RealtimeFeedUpdate {
 
 type RealtimeFeedEvents = EventEmitter<{
 	abort: []
-	error: [unknown]
 	update: [RealtimeFeedUpdate]
 }>
 
@@ -83,39 +78,42 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 	}
 
 	const events: RealtimeFeedEvents = new EventEmitter()
-	const startedFetchingAt = Date.now()
-	let lastSuccessfulFetchAt = 0
 
 	const fetchRealtimeFeed = async () => {
 		logger.trace(logCtx, 'fetching GTFS Realtime feed')
 
 		const abortController = new AbortController()
 		const { signal } = abortController
-		events.on('abort', abortController.abort)
+		const abort = () => abortController.abort()
+		events.once('abort', abort)
 
-		const t0 = performance.now()
-		const res = await ky(realtimeFeedUrl, {
-			signal,
-			redirect: 'follow',
-			headers: {
-				'user-agent': USER_AGENT,
-				...(realtimeFeedApiKey
-					? {
-							'x-api-key': realtimeFeedApiKey,
-						}
-					: {}),
-				// todo: accept header
-				// todo: caching headers
-			},
-			retry: {
-				limit: 3,
-			},
-			// todo: keepalive
-		})
-		const feedEncoded = Buffer.from(await res.arrayBuffer())
-		const fetchDurationMs = performance.now() - t0
-
-		events.removeListener('abort', abortController.abort)
+		let feedEncoded: Buffer
+		let fetchDurationMs: number
+		try {
+			const t0 = performance.now()
+			const res = await ky(realtimeFeedUrl, {
+				signal,
+				redirect: 'follow',
+				headers: {
+					'user-agent': USER_AGENT,
+					...(realtimeFeedApiKey
+						? {
+								'x-api-key': realtimeFeedApiKey,
+							}
+						: {}),
+					// todo: accept header
+					// todo: caching headers
+				},
+				retry: {
+					limit: 3,
+				},
+				// todo: keepalive
+			})
+			feedEncoded = Buffer.from(await res.arrayBuffer())
+			fetchDurationMs = performance.now() - t0
+		} finally {
+			events.removeListener('abort', abort)
+		}
 
 		logger.debug(
 			{
@@ -133,16 +131,6 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 			{ feed_name: realtimeFeedName },
 			Date.now() / 1000,
 		)
-		lastSuccessfulFetchAt = Date.now()
-		await publishCloudWatchMetrics([
-			{
-				MetricName: 'RealtimeFeedAgeSeconds',
-				Dimensions: feedNameDimension(realtimeFeedName),
-				Unit: 'Seconds',
-				Value: 0,
-			},
-		])
-
 		// todo: expose last-modified header, fall back to Date.now()
 		events.emit('update', { feedEncoded })
 
@@ -163,17 +151,8 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 				const { fetchDurationMs: _fetchDurationMs } = await fetchRealtimeFeed()
 				fetchDurationMs = _fetchDurationMs
 			} catch (err) {
+				if (!keepFetching) break
 				realtimeFeedFetchFailures.inc({ feed_name: realtimeFeedName })
-				await publishCloudWatchMetrics([
-					{
-						MetricName: 'RealtimeFeedAgeSeconds',
-						Dimensions: feedNameDimension(realtimeFeedName),
-						Unit: 'Seconds',
-						Value:
-							(Date.now() - (lastSuccessfulFetchAt || startedFetchingAt)) /
-							1000,
-					},
-				])
 				logger.warn(
 					{
 						...logCtx,
@@ -181,8 +160,8 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 					},
 					'failed to fetch GTFS Realtime feed',
 				)
-				events.emit('error', err)
 			}
+			if (!keepFetching) break
 
 			// wait so that we pull every `FETCH_INTERVAL_MS`, but at least `FETCH_INTERVAL_MIN_MS`
 			const _waitMs = Math.max(

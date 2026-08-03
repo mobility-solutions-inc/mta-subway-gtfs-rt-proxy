@@ -41,6 +41,11 @@ RUN apk add --update --no-cache \
 	postgresql18-client \
 	unzip \
 	zstd
+RUN curl -fsSL \
+	'https://truststore.pki.rds.amazonaws.com/us-east-2/us-east-2-bundle.pem' \
+	-o /etc/ssl/certs/aws-rds-us-east-2-bundle.pem \
+	&& echo 'd46e1bdfda05c8e7644e50930806a19b139a222542bf0348082fb59ece2b5fa5  /etc/ssl/certs/aws-rds-us-east-2-bundle.pem' \
+		| sha256sum -c -
 COPY --from=builder /app/curl-mirror.mjs ./
 RUN ln -s $PWD/curl-mirror.mjs /usr/local/bin/curl-mirror && curl-mirror --help >/dev/null
 
@@ -63,5 +68,6 @@ USER 1001
 EXPOSE 3000
 
 ENV PORT=3000
+ENV PGSSLROOTCERT=/etc/ssl/certs/aws-rds-us-east-2-bundle.pem
 
 CMD ["node", "dist/start.js"]

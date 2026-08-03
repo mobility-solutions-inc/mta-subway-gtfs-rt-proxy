@@ -531,6 +531,12 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 
 		// check matching with BAR_FEED
 		const fooScheduleFeedDigest = scheduleFeedDigest
+		const unfinishedImportDbName = `${SCHEDULE_FEED_DB_NAME_PREFIX}${scheduleFeedName}_unfinished`
+		{
+			const db = await connectToPostgres()
+			await db.query(`CREATE DATABASE "${unfinishedImportDbName}"`)
+			await promisify(db.end.bind(db))()
+		}
 		setScheduleFeed(BAR_FEED)
 		{
 			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
@@ -553,6 +559,18 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			)
 			ok(importedBar, 'set of imported Schedule feeds should include BAR_FEED')
 			scheduleFeedDigest = importedBar.scheduleFeedDigest
+
+			const db = await connectToPostgres()
+			const unfinishedImport = await db.query<{ exists: boolean }>(
+				'SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS exists',
+				[unfinishedImportDbName],
+			)
+			await promisify(db.end.bind(db))()
+			strictEqual(
+				unfinishedImport.rows[0]?.exists,
+				false,
+				'next changed import should clean an unfinished database',
+			)
 
 			const { entity: feedEntities } = await fetchAndParseMatchedRealtimeFeed({
 				port,

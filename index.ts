@@ -9,7 +9,10 @@ import type {
 	HttpResponse,
 	ScheduleFeedDatabase,
 } from './lib/types.js'
-import { publishCloudWatchMetrics } from './lib/cloudwatch-metrics.js'
+import {
+	feedNameDimension,
+	publishCloudWatchMetrics,
+} from './lib/cloudwatch-metrics.js'
 import { ALL_FEEDS } from './lib/feeds.js'
 import { startFetchingRealtimeFeed } from './lib/fetch-realtime-feed.js'
 import { createLogger } from './lib/logger.js'
@@ -178,38 +181,81 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 					scheduleFeedDigestSlice,
 				})
 
+			const startedProcessingAt = Date.now()
+			let lastSuccessfulProcessingAt = 0
+			let pendingFeedEncoded: Buffer | null = null
+			let processing = false
+			let stopped = false
+
+			const drainRealtimeFeedUpdates = async () => {
+				if (processing) return
+				processing = true
+				try {
+					while (!stopped && pendingFeedEncoded !== null) {
+						const feedEncoded = pendingFeedEncoded
+						pendingFeedEncoded = null
+						logger.trace(
+							{
+								...__logCtx,
+								feedEncoded,
+							},
+							'processing realtime feed',
+						)
+
+						try {
+							const feedMessage = await parseAndMatchRealtimeFeed(
+								feedEncoded,
+								realtimeFeedName,
+							)
+							setFeedMessage(feedMessage)
+							lastSuccessfulProcessingAt = Date.now()
+							await publishCloudWatchMetrics([
+								{
+									MetricName: 'RealtimeFeedAgeSeconds',
+									Dimensions: feedNameDimension(realtimeFeedName),
+									Unit: 'Seconds',
+									Value: 0,
+								},
+							])
+							logger.debug(
+								__logCtx,
+								'successfully processed realtime feed update',
+							)
+						} catch (err: unknown) {
+							await publishCloudWatchMetrics([
+								{
+									MetricName: 'RealtimeFeedAgeSeconds',
+									Dimensions: feedNameDimension(realtimeFeedName),
+									Unit: 'Seconds',
+									Value:
+										(Date.now() -
+											(lastSuccessfulProcessingAt || startedProcessingAt)) /
+										1000,
+								},
+							])
+							logger.warn(
+								{
+									...__logCtx,
+									error: err,
+								},
+								'failed to process realtime feed update',
+							)
+						}
+					}
+				} finally {
+					processing = false
+				}
+			}
+
 			const processRealtimeFeed = ({
 				feedEncoded,
 			}: {
 				feedEncoded: Buffer
 			}) => {
-				logger.trace(
-					{
-						...__logCtx,
-						feedEncoded,
-					},
-					'processing realtime feed',
-				)
-
-				void (async () => {
-					// todo: pass in `realtimeFeedName` for logging
-					const feedMessage = await parseAndMatchRealtimeFeed(
-						feedEncoded,
-						realtimeFeedName,
-					)
-					setFeedMessage(feedMessage)
-					logger.debug(__logCtx, 'successfully processed realtime feed update')
-				})().catch((err: unknown) => {
-					// todo: only warn-log for certain errors, otherwise error-log
-					logger.warn(
-						{
-							...__logCtx,
-							error: err,
-						},
-						'failed to process realtime feed update',
-					)
-				})
-				// todo: add metrics for success/fail
+				// When processing takes longer than the upstream cadence, keep only the
+				// newest pending response rather than serving updates out of order.
+				pendingFeedEncoded = feedEncoded
+				void drainRealtimeFeedUpdates()
 			}
 
 			// connect with realtime fetcher
@@ -218,6 +264,8 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 				realtimeFetchersByName.get(realtimeFeedName)!
 			realtimeFeedEvents.on('update', processRealtimeFeed)
 			const stopListeningToRealtimeFeedUpdates = () => {
+				stopped = true
+				pendingFeedEncoded = null
 				realtimeFeedEvents.removeListener('update', processRealtimeFeed)
 			}
 

@@ -194,8 +194,10 @@ const importDownloadedScheduleFeed = async (cfg: {
 				process.env.SCHEDULE_FETCHING_USER_AGENT ??
 				`${pkg.name} v${pkg.version}`,
 			gtfstidyBeforeImport: false,
-			// Pruning is deliberately deferred until the downloaded ZIP is archived.
-			determineDbsToRetain: (_imports, allDbs) => allDbs,
+			// Keep every successful version until its ZIP is archived and the lease
+			// policy can run. Databases absent from the successful-import ledger are
+			// unfinished imports and should be cleaned up by the importer.
+			determineDbsToRetain: (imports) => imports.map(({ dbName }) => dbName),
 			gtfsPostprocessingDPath: POSTPROCESSING_D_PATH,
 		})
 	} finally {
