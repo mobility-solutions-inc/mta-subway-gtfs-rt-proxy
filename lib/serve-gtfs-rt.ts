@@ -43,16 +43,28 @@ interface ServeFeedConfig {
 	scheduleFeedDigestSlice: string
 }
 
+type FeedEntityType = 'trip-updates' | 'vehicle-positions'
+
 const serveFeed = (cfg: ServeFeedConfig) => {
 	const { scheduleFeedDigestSlice } = cfg
 
 	// modeled after https://github.com/derhuerst/hafas-gtfs-rt-feed/blob/8.2.3/lib/serve.js#L144-L152
 	let feed: Buffer | null = null
+	let tripUpdatesFeed: Buffer | null = null
+	let vehiclePositionsFeed: Buffer | null = null
 	let timeModified = new Date(0)
 	let etag: string | null = null
 	const setFeed = (feedMessage: FeedMessage) => {
 		// todo: debug-log
 		feed = encodeFeedMessage(feedMessage)
+		tripUpdatesFeed = encodeFeedMessage({
+			...feedMessage,
+			entity: feedMessage.entity.filter((entity) => entity.trip_update != null),
+		})
+		vehiclePositionsFeed = encodeFeedMessage({
+			...feedMessage,
+			entity: feedMessage.entity.filter((entity) => entity.vehicle != null),
+		})
 		timeModified = new Date()
 		encodedFeedSizeBytes.set(
 			{
@@ -64,12 +76,22 @@ const serveFeed = (cfg: ServeFeedConfig) => {
 	}
 
 	// modeled after https://github.com/derhuerst/hafas-gtfs-rt-feed/blob/8.2.3/lib/serve.js#L172-L177
-	const onRequest = (req: HttpRequest, res: HttpResponse) => {
-		if (feed === null) {
+	const onRequest = (
+		req: HttpRequest,
+		res: HttpResponse,
+		entityType: FeedEntityType | null = null,
+	) => {
+		const selectedFeed =
+			entityType === 'trip-updates'
+				? tripUpdatesFeed
+				: entityType === 'vehicle-positions'
+					? vehiclePositionsFeed
+					: feed
+		if (selectedFeed === null) {
 			res.writeHead(404, 'feed not initialized yet').end()
 			return
 		}
-		serveBuffer(req, res, feed, {
+		serveBuffer(req, res, selectedFeed, {
 			timeModified,
 			etag,
 			// serve-buffer readme:
@@ -84,4 +106,5 @@ const serveFeed = (cfg: ServeFeedConfig) => {
 	}
 }
 
+export type { FeedEntityType }
 export { encodeFeedMessage, serveFeed }

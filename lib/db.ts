@@ -3,7 +3,13 @@ import { readFileSync } from 'node:fs'
 import type { PoolConfig } from 'pg'
 import _pg from 'pg'
 
+import { createLogger } from './logger.js'
+
 const { Pool } = _pg
+const logger = createLogger(
+	'postgres',
+	process.env.LOG_LEVEL_DATABASE ?? process.env.LOG_LEVEL ?? 'warn',
+)
 
 // pg doesn't support $PGSSLROOTCERT yet, so we pass it in ourselves if SSL is not disabled.
 // see https://github.com/brianc/node-postgres/issues/2723
@@ -49,6 +55,12 @@ const connectToPostgres = async (opt: PoolConfig = {}) => {
 	// > Do not use pool.query if you need transactional integrity: the pool will dispatch every query passed to pool.query on the first available idle client. Transactions within PostgreSQL are scoped to a single client and so dispatching individual queries within a single transaction across multiple, random clients will cause big problems in your app and not work. For more info please read transactions.
 	// https://node-postgres.com/api/pool
 	const db = new Pool(getPgOpts(opt))
+	db.on('error', (error) => {
+		logger.warn(
+			{ database: opt.database ?? process.env.PGDATABASE ?? null, error },
+			'idle PostgreSQL client disconnected',
+		)
+	})
 
 	// todo: don't parse timestamptz into JS Date, keep ISO 8601 strings
 	// todo: don't parse date into JS Date, keep ISO 8601 strings

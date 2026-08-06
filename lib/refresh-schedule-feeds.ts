@@ -1,17 +1,32 @@
-// todo: use import assertions once they're supported by Node.js & ESLint
-// https://github.com/tc39/proposal-import-assertions
 import { ok } from 'node:assert'
+import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
-import type { SuccessfulImport } from '#postgis-gtfs-importer'
+import type { AddressInfo } from 'node:net'
 import { queryImports } from '#postgis-gtfs-importer'
 import { importGtfsAtomically } from '#postgis-gtfs-importer/import'
-import { Gauge, Summary } from 'prom-client'
+import ky from 'ky'
+import pgFormat from 'pg-format'
+import { Counter, Gauge, Summary } from 'prom-client'
 
 import type { ScheduleFeedDatabase } from './types.js'
-import { getPgOpts } from './db.js'
+import {
+	feedNameDimension,
+	publishCloudWatchMetrics,
+} from './cloudwatch-metrics.js'
+import { connectToPostgres, getPgOpts } from './db.js'
 import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
+import {
+	deleteScheduleFeedArchiveByDatabaseName,
+	ensureScheduleFeedStore,
+	getLatestScheduleFeedCheck,
+	getScheduleFeedValidators,
+	isScheduleFeedDigestRetained,
+	markLatestScheduleFeedChecked,
+	storeScheduleFeedArchive,
+	withScheduleFeedDigestLock,
+} from './schedule-feed-store.js'
 
 const require = createRequire(import.meta.url)
 const pkg = require('../../package.json') as {
@@ -19,8 +34,6 @@ const pkg = require('../../package.json') as {
 	version: string
 }
 
-// todo: use import.meta.resolve once it is stable?
-// see https://nodejs.org/docs/latest-v20.x/api/esm.html#importmetaresolvespecifier
 const PREVIOUS_STOPTIMEUPDATES_POSTPROCESSING_D_PATH =
 	require.resolve('./postprocessing.d/previous-stoptimeupdates.sql')
 const POSTPROCESSING_D_PATH = dirname(
@@ -29,34 +42,57 @@ const POSTPROCESSING_D_PATH = dirname(
 
 const IMPORTER_LOG_LEVEL = process.env.LOG_LEVEL_POSTGIS_GTFS_IMPORTER ?? 'warn'
 const SCHEDULE_DATA_LOG_LEVEL = process.env.LOG_LEVEL_SCHEDULE_DATA ?? 'info'
-
 const DB_NAME_PREFIX = process.env.SCHEDULE_FEED_DB_NAME_PREFIX ?? 'gtfs_'
-
 const FETCH_INTERVAL_MS = process.env.SCHEDULE_FEED_REFRESH_INTERVAL
 	? parseInt(process.env.SCHEDULE_FEED_REFRESH_INTERVAL) * 1000
-	: 30 * 60 * 1000 // 30 minutes
+	: 15 * 60 * 1000
 const FETCH_INTERVAL_MIN_MS = process.env.SCHEDULE_FEED_REFRESH_MIN_INTERVAL
 	? parseInt(process.env.SCHEDULE_FEED_REFRESH_MIN_INTERVAL) * 1000
-	: 5 * 60 * 1000 // 5 minutes
-
-// Whenever a new GTFS Schedule dataset is imported, we only keep the most recent `MAX_SCHEDULE_DBS`. This is a trade-off between being able to serve OTP requests for older datasets (see readme.md) and disk storage.
-const MAX_SCHEDULE_DBS = 4
-
-// postgis-gtfs-importer passes the databases to us sorted descending by date+time of import.
-// Because the new database to be created is not included yet, we only keep `MAX_SCHEDULE_DBS - 1`. In case no new database is created (because the feed's digest hasn't changed), we end up with one DB less. Similarly, if the import fails, we end up with a DB more which is not usable.
-const determineDbsToRetain = (
-	latestSuccessfulImports: SuccessfulImport[],
-	_allDbs: string[],
-) => {
-	return latestSuccessfulImports
-		.slice(0, MAX_SCHEDULE_DBS - 1)
-		.map((_import) => _import.dbName)
-}
+	: 60 * 1000
+const STALE_AFTER_MS = process.env.SCHEDULE_FEED_STALE_AFTER
+	? parseInt(process.env.SCHEDULE_FEED_STALE_AFTER) * 1000
+	: 2 * 60 * 60 * 1000
 
 const noOfImportedScheduleFeeds = new Gauge({
 	name: 'imported_schedule_feeds_total',
-	help: 'number of currently imported GTFS-Schedule feeds',
+	help: 'number of currently imported GTFS Schedule feeds',
 	registers: [metricsRegister],
+})
+const scheduleFeedLastCheckedTimestamp = new Gauge({
+	name: 'schedule_feed_last_checked_timestamp_seconds',
+	help: 'UNIX timestamp of the latest successful upstream schedule check',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
+const scheduleFeedLastImportedTimestamp = new Gauge({
+	name: 'schedule_feed_last_imported_timestamp_seconds',
+	help: 'UNIX timestamp of the latest successful schedule import',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
+const scheduleFeedRefreshFailures = new Counter({
+	name: 'schedule_feed_refresh_failures_total',
+	help: 'number of failed schedule feed refresh cycles',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
+const fetchDurationSeconds = new Summary({
+	name: 'schedule_feed_fetch_duration_seconds',
+	help: 'time needed to fetch the GTFS Schedule feed',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
+const dataImported = new Gauge({
+	name: 'schedule_feed_imported_boolean',
+	help: 'during the last fetch/import cycle, whether the feed changed',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
+const importDurationSeconds = new Summary({
+	name: 'schedule_feed_import_duration_seconds',
+	help: 'time needed to import the GTFS Schedule feed',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
 })
 
 interface QueryImportedScheduleFeedVersionsConfig {
@@ -70,99 +106,228 @@ const queryImportedScheduleFeedVersions = async (
 	ok(scheduleFeedName, 'scheduleFeedName')
 
 	const databaseNamePrefix = `${DB_NAME_PREFIX}${scheduleFeedName}_`
-	const { latestSuccessfulImports } = await queryImports({
+	await ensureScheduleFeedStore()
+	const { allDbs, latestSuccessfulImports } = await queryImports({
 		databaseNamePrefix,
 		pgOpts: getPgOpts(),
 	})
-	const currentDatabases = latestSuccessfulImports.map((_import) => ({
-		name: _import.dbName,
-		importedAt: _import.importedAt,
-		feedDigest: _import.feedDigest,
-	}))
+	const existingDatabaseNames = new Set(allDbs)
+	const staleImports = latestSuccessfulImports.filter(
+		({ dbName }) => !existingDatabaseNames.has(dbName),
+	)
+	const validImportDatabaseNames = latestSuccessfulImports
+		.filter(({ dbName }) => existingDatabaseNames.has(dbName))
+		.map(({ dbName }) => dbName)
+	const db = await connectToPostgres()
+	try {
+		const { rows: orphanedArchives } = await db.query<{
+			db_name: string
+			feed_digest: string
+		}>(
+			`
+				SELECT db_name, feed_digest
+				FROM schedule_feed_archives
+				WHERE
+					substring(db_name FOR character_length($1)) = $1
+					AND NOT (db_name = ANY($2::text[]))
+			`,
+			[databaseNamePrefix, validImportDatabaseNames],
+		)
+		const staleBookkeeping = new Map(
+			staleImports.map(({ dbName, feedDigest }) => [dbName, feedDigest]),
+		)
+		for (const {
+			db_name: dbName,
+			feed_digest: feedDigest,
+		} of orphanedArchives) {
+			staleBookkeeping.set(dbName, feedDigest)
+		}
+		if (staleBookkeeping.size > 0) {
+			try {
+				await db.query('BEGIN')
+				for (const [dbName, feedDigest] of staleBookkeeping) {
+					scheduleLogger.warn(
+						{ feedDigest, scheduleDatabaseName: dbName },
+						'removing bookkeeping for an unavailable schedule database',
+					)
+					await db.query(
+						'DELETE FROM latest_successful_imports WHERE db_name = $1',
+						[dbName],
+					)
+					await deleteScheduleFeedArchiveByDatabaseName(dbName, db)
+				}
+				await db.query('COMMIT')
+			} catch (error) {
+				await db.query('ROLLBACK')
+				throw error
+			}
+		}
+	} finally {
+		await db.end()
+	}
+	const currentDatabases = latestSuccessfulImports
+		.filter(({ dbName }) => existingDatabaseNames.has(dbName))
+		.map((_import) => ({
+			name: _import.dbName,
+			importedAt: _import.importedAt,
+			feedDigest: _import.feedDigest,
+		}))
 	noOfImportedScheduleFeeds.set(currentDatabases.length)
-
 	return currentDatabases
 }
 
-const _importerLogger = createLogger(
-	'postgis-gtfs-importer',
-	IMPORTER_LOG_LEVEL,
-)
-interface FetchAndImportScheduleFeedConfig {
-	dataImported: Gauge<string>
+const importerLogger = createLogger('postgis-gtfs-importer', IMPORTER_LOG_LEVEL)
+const scheduleLogger = createLogger('schedule-data', SCHEDULE_DATA_LOG_LEVEL)
+
+const downloadScheduleFeed = async (cfg: {
 	feedName: string
-	fetchDurationSeconds: Summary<string>
 	gtfsDownloadUrl: string
-	importDurationSeconds: Summary<string>
-}
+}) => {
+	const { feedName, gtfsDownloadUrl } = cfg
+	const { etag, lastModified } = await getScheduleFeedValidators()
+	const headers: Record<string, string> = {
+		'user-agent':
+			process.env.SCHEDULE_FETCHING_USER_AGENT ?? `${pkg.name} v${pkg.version}`,
+	}
+	if (etag) headers['if-none-match'] = etag
+	if (lastModified) headers['if-modified-since'] = lastModified
 
-const fetchAndImportScheduleFeed = async (
-	cfg: FetchAndImportScheduleFeedConfig,
-) => {
-	const {
-		feedName,
-		gtfsDownloadUrl,
-		fetchDurationSeconds,
-		dataImported,
-		importDurationSeconds,
-	} = cfg
-	const databaseNamePrefix = `${DB_NAME_PREFIX}${feedName}_`
-
-	const verboseLogging = _importerLogger.isLevelEnabled('trace')
-
-	const res = await importGtfsAtomically({
-		logger: _importerLogger,
-		downloadScriptVerbose: verboseLogging,
-		connectDownloadScriptToStdout: verboseLogging,
-		importScriptVerbose: verboseLogging,
-		connectImportScriptToStdout: verboseLogging,
-		pgOpts: getPgOpts(),
-		databaseNamePrefix,
-		gtfsDownloadUrl,
-		gtfsDownloadUserAgent:
-			process.env.SCHEDULE_FETCHING_USER_AGENT ?? `${pkg.name} v${pkg.version}`, // todo: allow customising via env var, or pick up k8s pod name?
-		gtfstidyBeforeImport: false,
-		determineDbsToRetain,
-		gtfsPostprocessingDPath: POSTPROCESSING_D_PATH,
+	const startedAt = performance.now()
+	const response = await ky(gtfsDownloadUrl, {
+		headers,
+		redirect: 'follow',
+		retry: { limit: 3 },
+		throwHttpErrors: false,
 	})
-	const { downloadDurationMs, importSkipped, importDurationMs } = res
-
 	fetchDurationSeconds.observe(
 		{ feed_name: feedName },
-		downloadDurationMs / 1000,
-	)
-	dataImported.set({ feed_name: feedName }, importSkipped ? 0 : 1)
-	importDurationSeconds.observe(
-		{ feed_name: feedName },
-		importDurationMs / 1000,
+		(performance.now() - startedAt) / 1000,
 	)
 
-	return res
+	if (response.status === 304) {
+		return { changed: false as const }
+	}
+	if (!response.ok) {
+		throw new Error(`schedule feed request failed with HTTP ${response.status}`)
+	}
+
+	const feedZip = Buffer.from(await response.arrayBuffer())
+	if (feedZip.length === 0) throw new Error('downloaded schedule feed is empty')
+	return {
+		changed: true as const,
+		etag: response.headers.get('etag'),
+		feedZip,
+		lastModified: response.headers.get('last-modified'),
+	}
 }
 
-const fetchDurationSeconds = new Summary({
-	name: 'schedule_feed_fetch_duration_seconds',
-	help: 'time needed to fetch the GTFS Schedule feed',
-	registers: [metricsRegister],
-	labelNames: ['feed_name'],
-})
-// todo [breaking]: change to timestamp, rename to `schedule_feed_imported_timestamp_seconds`
-const dataImported = new Gauge({
-	name: 'schedule_feed_imported_boolean',
-	help: 'during the last fetch/import cycle, if the feed has changed and thus been imported',
-	registers: [metricsRegister],
-	labelNames: ['feed_name'],
-})
-const importDurationSeconds = new Summary({
-	name: 'schedule_feed_import_duration_seconds',
-	help: 'time needed to import the GTFS Schedule feed',
-	registers: [metricsRegister],
-	labelNames: ['feed_name'],
-})
+const importDownloadedScheduleFeed = async (cfg: {
+	feedZip: Buffer
+	feedName: string
+}) => {
+	const { feedName, feedZip } = cfg
+	const databaseNamePrefix = `${DB_NAME_PREFIX}${feedName}_`
+	const verboseLogging = importerLogger.isLevelEnabled('trace')
+	const localServer = createServer((_req, res) => {
+		res.setHeader('content-type', 'application/zip')
+		res.end(feedZip)
+	})
+	await new Promise<void>((resolve) => {
+		localServer.listen(0, '127.0.0.1', resolve)
+	})
+	const address = localServer.address() as AddressInfo
+	let result
+	try {
+		result = await importGtfsAtomically({
+			logger: importerLogger,
+			downloadScriptVerbose: verboseLogging,
+			connectDownloadScriptToStdout: verboseLogging,
+			importScriptVerbose: verboseLogging,
+			connectImportScriptToStdout: verboseLogging,
+			pgOpts: getPgOpts(),
+			databaseNamePrefix,
+			gtfsDownloadUrl: `http://127.0.0.1:${address.port}/gtfs.zip`,
+			gtfsDownloadUserAgent:
+				process.env.SCHEDULE_FETCHING_USER_AGENT ??
+				`${pkg.name} v${pkg.version}`,
+			gtfstidyBeforeImport: false,
+			// Keep every successful version until its ZIP is archived and the lease
+			// policy can run. Databases absent from the successful-import ledger are
+			// unfinished imports and should be cleaned up by the importer.
+			determineDbsToRetain: (imports) => imports.map(({ dbName }) => dbName),
+			gtfsPostprocessingDPath: POSTPROCESSING_D_PATH,
+		})
+	} finally {
+		await new Promise<void>((resolve, reject) => {
+			localServer.close((error) => {
+				if (error) reject(error)
+				else resolve()
+			})
+		})
+	}
+	dataImported.set({ feed_name: feedName }, result.importSkipped ? 0 : 1)
+	if (result.importDurationMs !== null) {
+		importDurationSeconds.observe(
+			{ feed_name: feedName },
+			result.importDurationMs / 1000,
+		)
+	}
+	return result
+}
 
-const _scheduleLogger = createLogger('schedule-data', SCHEDULE_DATA_LOG_LEVEL)
+const pruneScheduleFeedVersions = async (scheduleFeedName: string) => {
+	const current = await queryImportedScheduleFeedVersions({
+		scheduleFeedName,
+	})
+	const [latest] = current
+	if (!latest) return current
+
+	const obsolete = current.filter(({ name }) => name !== latest.name)
+	if (obsolete.length === 0) return current
+
+	const db = await connectToPostgres()
+	try {
+		for (const { feedDigest, name } of obsolete) {
+			await withScheduleFeedDigestLock(db, feedDigest, async (client) => {
+				if (
+					feedDigest !== latest.feedDigest &&
+					(await isScheduleFeedDigestRetained(
+						client,
+						feedDigest,
+						latest.feedDigest,
+					))
+				) {
+					return
+				}
+				scheduleLogger.info(
+					{ feedDigest, scheduleDatabaseName: name },
+					'pruning unleased schedule feed version',
+				)
+				await client.query(pgFormat('DROP DATABASE %I WITH (FORCE)', name))
+				await client.query('BEGIN')
+				try {
+					await client.query(
+						'DELETE FROM latest_successful_imports WHERE db_name = $1',
+						[name],
+					)
+					await deleteScheduleFeedArchiveByDatabaseName(name, client)
+					await client.query('COMMIT')
+				} catch (error) {
+					await client.query('ROLLBACK')
+					throw error
+				}
+			})
+		}
+	} finally {
+		await db.end()
+	}
+	return await queryImportedScheduleFeedVersions({ scheduleFeedName })
+}
+
 interface StartRefreshingScheduleFeedConfig {
-	onImportDone: (payload: { currentDatabases: ScheduleFeedDatabase[] }) => void
+	onImportDone: (payload: {
+		currentDatabases: ScheduleFeedDatabase[]
+	}) => Promise<void> | void
 	scheduleFeedName: string
 	scheduleFeedUrl: string
 }
@@ -175,104 +340,159 @@ const startRefreshingScheduleFeed = (
 	ok(scheduleFeedUrl, 'scheduleFeedUrl')
 	ok(onImportDone, 'onImportDone')
 
-	const logger = _scheduleLogger
-	const logCtx = {
-		scheduleFeedName,
-	}
-
 	let keepRefreshing = true
 	let waitTimer: NodeJS.Timeout | null = null
-	// Environments like Kubernetes deploy a new version of a service as a new instance next to the old instance, and only kill the old one once the new now is ready.
-	// Even though it would make sense to only report as ready once we have imported the Schedule data (or made sure it's up-to-date) at least once,
-	// 1. this makes the new instance take a long time to become ready, which in turn means that
-	// 2. the old instance to become unhealthy because it can't import new Schedule feed versions (because only one instance can import at a time and the new instance is already importing), which
-	// 3. causes Kubernetes to consider both instances not ready/unhealthy and eventually kill both of them,
-	// 4. leading to and endless loop of unavailable instances.
-	// This is why we sacrifice the reliability and observability of checking for the first Schedule import here.
-	// let isReady = false
-	let isReady = true
-	let isHealthy = true
-	;(async () => {
-		// If an import crashes the process, the latter will be restarted by the environment (e.g. Kubernetes) and attempt another import *right away*.
-		// todo: use a proper task scheduler with a back-off logic, e.g. Kubernetes CronJob [1]
-		// [1] https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/
-		while (keepRefreshing) {
-			logger.trace(logCtx, 'refreshing imported schedule feeds')
-			const t0 = performance.now()
-			// todo: catch and log failures
-			// todo: expose res.downloadDurationMs as metric?
-			// todo: expose res.importSkipped as metric?
-			// todo: expose res.importDurationMs as metric?
-			await fetchAndImportScheduleFeed({
-				feedName: scheduleFeedName,
-				gtfsDownloadUrl: scheduleFeedUrl,
-				fetchDurationSeconds,
-				dataImported,
-				importDurationSeconds,
-			})
-			const timePassedMs = performance.now() - t0
+	let isReady = false
+	let lastSuccessfulCheckAt = 0
 
-			const currentDatabases = await queryImportedScheduleFeedVersions({
-				scheduleFeedName,
-			})
-			logger.debug(
-				{
-					...logCtx,
-					timePassedMs,
-					currentDatabases,
-				},
-				'refreshed imported schedule feeds',
-			)
-
-			isHealthy = true
+	void (async () => {
+		await ensureScheduleFeedStore()
+		const existing = await queryImportedScheduleFeedVersions({
+			scheduleFeedName,
+		})
+		if (existing.length > 0) {
 			isReady = true
-			onImportDone({
-				currentDatabases,
-			})
+			const persistedLastCheck = await getLatestScheduleFeedCheck()
+			lastSuccessfulCheckAt = persistedLastCheck?.getTime() ?? 0
+			if (lastSuccessfulCheckAt > 0) {
+				scheduleFeedLastCheckedTimestamp.set(
+					{ feed_name: scheduleFeedName },
+					lastSuccessfulCheckAt / 1000,
+				)
+			}
+			await onImportDone({ currentDatabases: existing })
+		}
 
-			// wait so that we pull every `FETCH_INTERVAL_MS`, but at least `FETCH_INTERVAL_MIN_MS`
-			const _waitMs = Math.max(
+		while (keepRefreshing) {
+			const startedAt = performance.now()
+			try {
+				const download = await downloadScheduleFeed({
+					feedName: scheduleFeedName,
+					gtfsDownloadUrl: scheduleFeedUrl,
+				})
+
+				let currentDatabases = existing
+				if (download.changed) {
+					const result = await importDownloadedScheduleFeed({
+						feedZip: download.feedZip,
+						feedName: scheduleFeedName,
+					})
+					currentDatabases = await queryImportedScheduleFeedVersions({
+						scheduleFeedName,
+					})
+					const imported = result.newImport
+						? {
+								name: result.newImport.dbName,
+								feedDigest: result.newImport.feedDigest,
+								importedAt: result.newImport.importedAt,
+							}
+						: currentDatabases[0]
+					ok(imported, 'schedule import did not produce an imported database')
+					await storeScheduleFeedArchive({
+						dbName: imported.name,
+						etag: download.etag,
+						feedDigest: imported.feedDigest,
+						feedZip: download.feedZip,
+						importedAt: imported.importedAt,
+						lastModified: download.lastModified,
+					})
+					currentDatabases = await pruneScheduleFeedVersions(scheduleFeedName)
+					if (!result.importSkipped) {
+						scheduleFeedLastImportedTimestamp.set(
+							{ feed_name: scheduleFeedName },
+							imported.importedAt,
+						)
+					}
+				} else {
+					dataImported.set({ feed_name: scheduleFeedName }, 0)
+					currentDatabases = await pruneScheduleFeedVersions(scheduleFeedName)
+					const checkedAt = await markLatestScheduleFeedChecked()
+					ok(
+						checkedAt,
+						'unchanged schedule feed has no archived successful version',
+					)
+					lastSuccessfulCheckAt = checkedAt.getTime()
+				}
+
+				if (download.changed) {
+					const persistedLastCheck = await getLatestScheduleFeedCheck()
+					ok(
+						persistedLastCheck,
+						'imported schedule feed has no check timestamp',
+					)
+					lastSuccessfulCheckAt = persistedLastCheck.getTime()
+				}
+				scheduleFeedLastCheckedTimestamp.set(
+					{ feed_name: scheduleFeedName },
+					lastSuccessfulCheckAt / 1000,
+				)
+				await publishCloudWatchMetrics([
+					{
+						MetricName: 'ScheduleRefreshSuccess',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Count',
+						Value: 1,
+					},
+					{
+						MetricName: 'ScheduleAgeSeconds',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Seconds',
+						Value: Math.max(0, (Date.now() - lastSuccessfulCheckAt) / 1000),
+					},
+				])
+				isReady = currentDatabases.length > 0
+				await onImportDone({ currentDatabases })
+			} catch (error) {
+				scheduleFeedRefreshFailures.inc({ feed_name: scheduleFeedName })
+				await publishCloudWatchMetrics([
+					{
+						MetricName: 'ScheduleRefreshSuccess',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Count',
+						Value: 0,
+					},
+					{
+						MetricName: 'ScheduleAgeSeconds',
+						Dimensions: feedNameDimension(scheduleFeedName),
+						Unit: 'Seconds',
+						Value:
+							lastSuccessfulCheckAt > 0
+								? (Date.now() - lastSuccessfulCheckAt) / 1000
+								: STALE_AFTER_MS / 1000 + 1,
+					},
+				])
+				scheduleLogger.error(
+					{ error, scheduleFeedName },
+					'failed to refresh GTFS Schedule feed; retaining last successful version',
+				)
+			}
+
+			const timePassedMs = performance.now() - startedAt
+			const waitMs = Math.max(
 				FETCH_INTERVAL_MS - timePassedMs,
 				FETCH_INTERVAL_MIN_MS,
 			)
 			await new Promise<void>((resolve) => {
-				waitTimer = setTimeout(resolve, _waitMs)
+				waitTimer = setTimeout(resolve, waitMs)
 			})
 		}
-	})().catch((err: unknown) => {
-		isHealthy = false
-		logger.error(
-			{
-				error: err,
-			},
-			`failed to refresh the "${scheduleFeedName}" GTFS Schedule feed`,
+	})().catch((error: unknown) => {
+		scheduleLogger.error(
+			{ error, scheduleFeedName },
+			'schedule refresh loop stopped unexpectedly',
 		)
-		// throw err
 	})
 
 	const stopRefreshing = () => {
 		keepRefreshing = false
-		if (waitTimer !== null) {
-			clearTimeout(waitTimer)
-		}
+		if (waitTimer !== null) clearTimeout(waitTimer)
 	}
-
-	const checkIfHealthy = () => {
-		if (isHealthy) {
-			logger.trace('service seems healthy')
-		} else {
-			logger.warn(`service doesn't seem healthy`)
-		}
-		return Promise.resolve(isHealthy)
-	}
-	const checkIfReady = () => {
-		if (isReady) {
-			logger.trace('service seems ready')
-		} else {
-			logger.debug(`service doesn't seem ready (yet?)`)
-		}
-		return Promise.resolve(isReady)
-	}
+	const checkIfHealthy = () =>
+		Promise.resolve(
+			lastSuccessfulCheckAt > 0 &&
+				Date.now() - lastSuccessfulCheckAt <= STALE_AFTER_MS,
+		)
+	const checkIfReady = () => Promise.resolve(isReady)
 
 	return {
 		stopRefreshing,
@@ -281,4 +501,8 @@ const startRefreshingScheduleFeed = (
 	}
 }
 
-export { queryImportedScheduleFeedVersions, startRefreshingScheduleFeed }
+export {
+	pruneScheduleFeedVersions,
+	queryImportedScheduleFeedVersions,
+	startRefreshingScheduleFeed,
+}

@@ -4,7 +4,7 @@ import { ok } from 'node:assert'
 import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import ky from 'ky'
-import { Summary } from 'prom-client'
+import { Counter, Gauge, Summary } from 'prom-client'
 
 import { createLogger } from './logger.js'
 import { register as metricsRegister } from './metrics.js'
@@ -24,7 +24,7 @@ const USER_AGENT =
 // todo [breaking]: rename to `REALTIME_FEED_FETCH_INTERVAL_MS`
 const FETCH_INTERVAL_MS = process.env.REALTIME_FEED_FETCH_INTERVAL
 	? parseInt(process.env.REALTIME_FEED_FETCH_INTERVAL) * 1000
-	: 60 * 1000 // 1 minute
+	: 30 * 1000
 // todo [breaking]: rename to `REALTIME_FEED_FETCH_MIN_INTERVAL_MS`
 const FETCH_INTERVAL_MIN_MS = process.env.REALTIME_FEED_FETCH_MIN_INTERVAL
 	? parseInt(process.env.REALTIME_FEED_FETCH_MIN_INTERVAL) * 1000
@@ -38,6 +38,18 @@ const fetchDurationSeconds = new Summary({
 	registers: [metricsRegister],
 	labelNames: ['feed_name'],
 })
+const realtimeFeedLastSuccessfulFetchTimestamp = new Gauge({
+	name: 'realtime_feed_last_successful_fetch_timestamp_seconds',
+	help: 'UNIX timestamp of the latest successful GTFS Realtime fetch',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
+const realtimeFeedFetchFailures = new Counter({
+	name: 'realtime_feed_fetch_failures_total',
+	help: 'number of failed GTFS Realtime fetches',
+	registers: [metricsRegister],
+	labelNames: ['feed_name'],
+})
 
 interface RealtimeFeedUpdate {
 	feedEncoded: Buffer
@@ -45,7 +57,6 @@ interface RealtimeFeedUpdate {
 
 type RealtimeFeedEvents = EventEmitter<{
 	abort: []
-	error: [unknown]
 	update: [RealtimeFeedUpdate]
 }>
 
@@ -73,31 +84,36 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 
 		const abortController = new AbortController()
 		const { signal } = abortController
-		events.on('abort', abortController.abort)
+		const abort = () => abortController.abort()
+		events.once('abort', abort)
 
-		const t0 = performance.now()
-		const res = await ky(realtimeFeedUrl, {
-			signal,
-			redirect: 'follow',
-			headers: {
-				'user-agent': USER_AGENT,
-				...(realtimeFeedApiKey
-					? {
-							'x-api-key': realtimeFeedApiKey,
-						}
-					: {}),
-				// todo: accept header
-				// todo: caching headers
-			},
-			retry: {
-				limit: 3,
-			},
-			// todo: keepalive
-		})
-		const feedEncoded = Buffer.from(await res.arrayBuffer())
-		const fetchDurationMs = performance.now() - t0
-
-		events.removeListener('abort', abortController.abort)
+		let feedEncoded: Buffer
+		let fetchDurationMs: number
+		try {
+			const t0 = performance.now()
+			const res = await ky(realtimeFeedUrl, {
+				signal,
+				redirect: 'follow',
+				headers: {
+					'user-agent': USER_AGENT,
+					...(realtimeFeedApiKey
+						? {
+								'x-api-key': realtimeFeedApiKey,
+							}
+						: {}),
+					// todo: accept header
+					// todo: caching headers
+				},
+				retry: {
+					limit: 3,
+				},
+				// todo: keepalive
+			})
+			feedEncoded = Buffer.from(await res.arrayBuffer())
+			fetchDurationMs = performance.now() - t0
+		} finally {
+			events.removeListener('abort', abort)
+		}
 
 		logger.debug(
 			{
@@ -111,7 +127,10 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 			{ feed_name: realtimeFeedName },
 			fetchDurationMs / 1000,
 		)
-
+		realtimeFeedLastSuccessfulFetchTimestamp.set(
+			{ feed_name: realtimeFeedName },
+			Date.now() / 1000,
+		)
 		// todo: expose last-modified header, fall back to Date.now()
 		events.emit('update', { feedEncoded })
 
@@ -132,6 +151,8 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 				const { fetchDurationMs: _fetchDurationMs } = await fetchRealtimeFeed()
 				fetchDurationMs = _fetchDurationMs
 			} catch (err) {
+				if (!keepFetching) break
+				realtimeFeedFetchFailures.inc({ feed_name: realtimeFeedName })
 				logger.warn(
 					{
 						...logCtx,
@@ -139,8 +160,8 @@ const startFetchingRealtimeFeed = (cfg: StartFetchingRealtimeFeedConfig) => {
 					},
 					'failed to fetch GTFS Realtime feed',
 				)
-				events.emit('error', err)
 			}
+			if (!keepFetching) break
 
 			// wait so that we pull every `FETCH_INTERVAL_MS`, but at least `FETCH_INTERVAL_MIN_MS`
 			const _waitMs = Math.max(

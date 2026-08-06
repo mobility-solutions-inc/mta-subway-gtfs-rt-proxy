@@ -1,37 +1,65 @@
 import { ok } from 'node:assert'
 import { createServer as createHttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { Counter } from 'prom-client'
 
+import type { FeedEntityType } from './lib/serve-gtfs-rt.js'
 import type {
 	HttpRequest,
 	HttpResponse,
 	ScheduleFeedDatabase,
 } from './lib/types.js'
+import {
+	feedNameDimension,
+	publishCloudWatchMetrics,
+} from './lib/cloudwatch-metrics.js'
 import { ALL_FEEDS } from './lib/feeds.js'
 import { startFetchingRealtimeFeed } from './lib/fetch-realtime-feed.js'
 import { createLogger } from './lib/logger.js'
 import { createParseAndProcessFeed } from './lib/match.js'
-import { createMetricsServer } from './lib/metrics.js'
 import {
-	queryImportedScheduleFeedVersions,
+	createMetricsServer,
+	register as metricsRegister,
+} from './lib/metrics.js'
+import { protobufLongToNumber } from './lib/protobuf.js'
+import {
+	pruneScheduleFeedVersions,
 	startRefreshingScheduleFeed,
 } from './lib/refresh-schedule-feeds.js'
+import {
+	closeScheduleFeedStore,
+	getScheduleFeedArchive,
+	listScheduleFeedArchives,
+	markScheduleFeedRequested,
+} from './lib/schedule-feed-store.js'
 import { serveFeed } from './lib/serve-gtfs-rt.js'
 
 const SERVICE_LOG_LEVEL = process.env.LOG_LEVEL_SERVICE ?? 'info'
+
+const unavailableScheduleFeedRequests = new Counter({
+	name: 'schedule_feed_unavailable_digest_requests_total',
+	help: 'number of requests for a schedule feed digest that is unavailable',
+	labelNames: ['endpoint'],
+	registers: [metricsRegister],
+})
 
 interface CreateServiceOptions {
 	port?: number
 }
 
 interface FeedHandler {
-	serveFeed: (req: HttpRequest, res: HttpResponse) => void
+	serveFeed: (
+		req: HttpRequest,
+		res: HttpResponse,
+		entityType?: FeedEntityType | null,
+	) => void
 	stop: () => void
 }
 
 interface ScheduleFeedHandlers {
 	checkIfHealthy: () => Promise<boolean>
 	closeConnections: () => Promise<void>
+	databaseName: string
 	feedHandlers: Map<string, FeedHandler>
 }
 
@@ -155,38 +183,86 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 					scheduleFeedDigestSlice,
 				})
 
+			const startedProcessingAt = Date.now()
+			let lastSuccessfulProcessingAt = 0
+			let pendingFeedEncoded: Buffer | null = null
+			let processing = false
+			let stopped = false
+
+			const drainRealtimeFeedUpdates = async () => {
+				if (processing) return
+				processing = true
+				try {
+					while (!stopped && pendingFeedEncoded !== null) {
+						const feedEncoded = pendingFeedEncoded
+						pendingFeedEncoded = null
+						logger.trace(
+							{
+								...__logCtx,
+								feedEncoded,
+							},
+							'processing realtime feed',
+						)
+
+						try {
+							const feedMessage = await parseAndMatchRealtimeFeed(
+								feedEncoded,
+								realtimeFeedName,
+							)
+							setFeedMessage(feedMessage)
+							lastSuccessfulProcessingAt = Date.now()
+							const sourceTimestamp = feedMessage.header.timestamp
+							const sourceTimestampMs =
+								sourceTimestamp === undefined || sourceTimestamp === null
+									? lastSuccessfulProcessingAt
+									: protobufLongToNumber(sourceTimestamp) * 1000
+							await publishCloudWatchMetrics([
+								{
+									MetricName: 'RealtimeFeedAgeSeconds',
+									Dimensions: feedNameDimension(realtimeFeedName),
+									Unit: 'Seconds',
+									Value: Math.max(0, (Date.now() - sourceTimestampMs) / 1000),
+								},
+							])
+							logger.debug(
+								__logCtx,
+								'successfully processed realtime feed update',
+							)
+						} catch (err: unknown) {
+							await publishCloudWatchMetrics([
+								{
+									MetricName: 'RealtimeFeedAgeSeconds',
+									Dimensions: feedNameDimension(realtimeFeedName),
+									Unit: 'Seconds',
+									Value:
+										(Date.now() -
+											(lastSuccessfulProcessingAt || startedProcessingAt)) /
+										1000,
+								},
+							])
+							logger.warn(
+								{
+									...__logCtx,
+									error: err,
+								},
+								'failed to process realtime feed update',
+							)
+						}
+					}
+				} finally {
+					processing = false
+				}
+			}
+
 			const processRealtimeFeed = ({
 				feedEncoded,
 			}: {
 				feedEncoded: Buffer
 			}) => {
-				logger.trace(
-					{
-						...__logCtx,
-						feedEncoded,
-					},
-					'processing realtime feed',
-				)
-
-				void (async () => {
-					// todo: pass in `realtimeFeedName` for logging
-					const feedMessage = await parseAndMatchRealtimeFeed(
-						feedEncoded,
-						realtimeFeedName,
-					)
-					setFeedMessage(feedMessage)
-					logger.debug(__logCtx, 'successfully processed realtime feed update')
-				})().catch((err: unknown) => {
-					// todo: only warn-log for certain errors, otherwise error-log
-					logger.warn(
-						{
-							...__logCtx,
-							error: err,
-						},
-						'failed to process realtime feed update',
-					)
-				})
-				// todo: add metrics for success/fail
+				// When processing takes longer than the upstream cadence, keep only the
+				// newest pending response rather than serving updates out of order.
+				pendingFeedEncoded = feedEncoded
+				void drainRealtimeFeedUpdates()
 			}
 
 			// connect with realtime fetcher
@@ -195,6 +271,8 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 				realtimeFetchersByName.get(realtimeFeedName)!
 			realtimeFeedEvents.on('update', processRealtimeFeed)
 			const stopListeningToRealtimeFeedUpdates = () => {
+				stopped = true
+				pendingFeedEncoded = null
 				realtimeFeedEvents.removeListener('update', processRealtimeFeed)
 			}
 
@@ -214,6 +292,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			feedHandlers,
 			closeConnections: stopMatchingRealtimeFeed,
 			checkIfHealthy: checkIfMatcherIsHealthy,
+			databaseName: scheduleDatabaseName,
 		})
 	}
 
@@ -247,9 +326,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 
 	let currentDatabases: ScheduleFeedDatabase[] = []
 	{
-		currentDatabases = await queryImportedScheduleFeedVersions({
-			scheduleFeedName,
-		})
+		currentDatabases = await pruneScheduleFeedVersions(scheduleFeedName)
 		// todo: do this in parallel?
 		for (const { name, feedDigest } of currentDatabases) {
 			logger.trace(
@@ -263,10 +340,11 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 	const {
 		checkIfHealthy: checkIfScheduleFeedRefreshIsHealthy,
 		checkIfReady: checkIfScheduleFeedRefreshIsReady,
+		stopRefreshing: stopRefreshingScheduleFeed,
 	} = startRefreshingScheduleFeed({
 		scheduleFeedName,
 		scheduleFeedUrl,
-		onImportDone: ({ currentDatabases: _currentDatabases }) => {
+		onImportDone: async ({ currentDatabases: _currentDatabases }) => {
 			currentDatabases = _currentDatabases
 			logger.trace(
 				logCtx,
@@ -291,12 +369,29 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			for (const newScheduleFeedVersion of currentDatabases) {
 				const { name: scheduleDatabaseName, feedDigest: scheduleFeedDigest } =
 					newScheduleFeedVersion
+				const existingHandlers =
+					feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
+				if (
+					existingHandlers &&
+					existingHandlers.databaseName !== scheduleDatabaseName
+				) {
+					logger.info(
+						{
+							...logCtx,
+							scheduleFeedDigest,
+							oldScheduleDatabaseName: existingHandlers.databaseName,
+							scheduleDatabaseName,
+						},
+						'replacing matcher after a digest was re-imported',
+					)
+					removeScheduleFeedVersion(scheduleFeedDigest)
+				}
 				if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
 					logger.trace(
 						logCtx,
 						`adding handlers for new schedule feed version with digest "${scheduleFeedDigest}"`,
 					)
-					void addScheduleFeedVersion(scheduleFeedDigest, scheduleDatabaseName)
+					await addScheduleFeedVersion(scheduleFeedDigest, scheduleDatabaseName)
 				}
 			}
 		},
@@ -346,10 +441,23 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			return
 		}
 
-		// /feeds/:realtimeFeedName?schedule-feed-digest
+		// /feeds/:realtimeFeedName[/:entityType]?schedule-feed-digest
 		// todo: use express for routing?
-		if (pathComponents[0] === 'feeds' && pathComponents.length === 2) {
+		if (
+			pathComponents[0] === 'feeds' &&
+			(pathComponents.length === 2 || pathComponents.length === 3)
+		) {
 			const realtimeFeedName = pathComponents[1]
+			const entityType = pathComponents[2] ?? null
+			if (
+				entityType !== null &&
+				entityType !== 'trip-updates' &&
+				entityType !== 'vehicle-positions'
+			) {
+				res.statusCode = 404
+				res.end('invalid realtime entity type')
+				return
+			}
 			if (!realtimeFetchersByName.has(realtimeFeedName)) {
 				res.statusCode = 404
 				res.end('invalid realtime feed name')
@@ -363,16 +471,102 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			}
 			const scheduleFeedDigest = url.searchParams.get('schedule-feed-digest')
 			ok(scheduleFeedDigest, 'missing schedule-feed-digest parameter')
-			if (!feedHandlersByScheduleFeedDigest.has(scheduleFeedDigest)) {
-				res.statusCode = 404
-				res.end('invalid/unknown schedule-feed-digest')
-				return
-			}
+			void (async () => {
+				const marked = await markScheduleFeedRequested(scheduleFeedDigest)
+				if (!marked) {
+					unavailableScheduleFeedRequests.inc({ endpoint: 'realtime' })
+					await publishCloudWatchMetrics([
+						{
+							MetricName: 'UnavailableDigestRequests',
+							Unit: 'Count',
+							Value: 1,
+						},
+					])
+					res.statusCode = 404
+					res.end('invalid/unknown schedule-feed-digest')
+					return
+				}
+				const handlers =
+					feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)
+				if (!handlers) {
+					res.statusCode = 503
+					res.end('schedule feed digest is not ready')
+					return
+				}
+				const feedHandler = handlers.feedHandlers.get(realtimeFeedName)
+				ok(feedHandler, 'missing realtime feed handler')
+				const { serveFeed } = feedHandler
+				serveFeed(req, res, entityType)
+			})().catch((error: unknown) => {
+				logger.warn(
+					{ error, scheduleFeedDigest },
+					'failed to renew schedule feed lease',
+				)
+				res.statusCode = 503
+				res.end('failed to renew schedule feed lease')
+			})
+			return
+		}
 
-			const { feedHandlers } =
-				feedHandlersByScheduleFeedDigest.get(scheduleFeedDigest)!
-			const { serveFeed } = feedHandlers.get(realtimeFeedName)!
-			serveFeed(req, res)
+		if (pathComponents[0] === 'schedule-feeds' && pathComponents.length === 1) {
+			void (async () => {
+				const archives = await listScheduleFeedArchives()
+				res.setHeader('content-type', 'application/json')
+				res.end(
+					JSON.stringify({
+						latestScheduleFeedDigest: archives[0]?.feedDigest ?? null,
+						scheduleFeeds: archives,
+					}),
+				)
+			})().catch((error: unknown) => {
+				logger.warn({ error }, 'failed to list archived schedule feeds')
+				res.statusCode = 503
+				res.end('failed to list schedule feeds')
+			})
+			return
+		}
+
+		if (pathComponents[0] === 'schedule-feeds' && pathComponents.length === 2) {
+			const scheduleFeedDigest = pathComponents[1]
+			void (async () => {
+				const archive = await getScheduleFeedArchive(scheduleFeedDigest)
+				if (archive === null) {
+					unavailableScheduleFeedRequests.inc({ endpoint: 'archive' })
+					void publishCloudWatchMetrics([
+						{
+							MetricName: 'UnavailableDigestRequests',
+							Unit: 'Count',
+							Value: 1,
+						},
+					])
+					res.statusCode = 404
+					res.end('invalid/unknown schedule-feed-digest')
+					return
+				}
+				res.setHeader('content-type', 'application/zip')
+				res.setHeader(
+					'content-disposition',
+					`attachment; filename="nyct-subway-${scheduleFeedDigest}.zip"`,
+				)
+				if (archive.etag) res.setHeader('etag', archive.etag)
+				if (archive.lastModified) {
+					res.setHeader('last-modified', archive.lastModified)
+				}
+				res.end(archive.feedZip)
+			})().catch((error: unknown) => {
+				logger.warn(
+					{ error, scheduleFeedDigest },
+					'failed to serve archived schedule feed',
+				)
+				res.statusCode = 503
+				res.end('failed to serve schedule feed')
+			})
+			return
+		}
+
+		if (pathComponents[0] === 'live' && pathComponents.length === 1) {
+			res.statusCode = 200
+			res.end('')
 			return
 		}
 
@@ -441,6 +635,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 	)
 
 	const stopService = async () => {
+		stopRefreshingScheduleFeed()
 		// todo: info-log
 		for (const { abortFetching } of realtimeFetchersByName.values()) {
 			abortFetching()
@@ -450,6 +645,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 		} of feedHandlersByScheduleFeedDigest.values()) {
 			await closeConnections()
 		}
+		await closeScheduleFeedStore()
 		server.close()
 	}
 

@@ -36,8 +36,11 @@ const BAR_FEED = readFileSync(
 
 const serveFile = async (filename: string) => {
 	let file: Buffer | null = null
+	let version = 0
+	let notModifiedRequests = 0
 	const setFile = (newFile: Buffer) => {
 		file = newFile
+		version++
 	}
 	const serveFile = (
 		req: IncomingMessage,
@@ -45,6 +48,13 @@ const serveFile = async (filename: string) => {
 	) => {
 		const { pathname } = new URL(req.url ?? '/', 'http://example.org')
 		if (pathname === '/' + filename && file !== null) {
+			const etag = `"${filename}-${version}"`
+			res.setHeader('etag', etag)
+			if (req.headers['if-none-match'] === etag) {
+				notModifiedRequests++
+				res.writeHead(304).end()
+				return
+			}
 			res.end(file)
 		} else {
 			res.writeHead(404).end()
@@ -64,6 +74,7 @@ const serveFile = async (filename: string) => {
 		'test file server must listen on a TCP port',
 	)
 	return {
+		getNotModifiedRequestCount: () => notModifiedRequests,
 		port: address.port,
 		stop: async () => {
 			await new Promise<void>((resolve, reject) => {
@@ -94,20 +105,54 @@ const fetchImportedScheduleFeeds = async (cfg: { port: number }) => {
 	return await res.json<ImportedScheduleFeed[]>()
 }
 
+const waitForImportedScheduleFeeds = async (cfg: {
+	expectedCount: number
+	port: number
+	timeoutMs?: number
+}) => {
+	const { expectedCount, port, timeoutMs = 30_000 } = cfg
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		try {
+			const feeds = await fetchImportedScheduleFeeds({ port })
+			if (feeds.length === expectedCount) return feeds
+		} catch {
+			// The service may still be starting.
+		}
+		await new Promise((resolve) => setTimeout(resolve, 500))
+	}
+	throw new Error(
+		`timed out waiting for ${expectedCount} imported schedule feed(s)`,
+	)
+}
+
 const fetchAndParseMatchedRealtimeFeed = async (cfg: {
+	entityType?: 'trip-updates' | 'vehicle-positions'
 	port: number
 	realtimeFeedName: string
 	scheduleFeedDigest: string
 }) => {
-	const { port, realtimeFeedName, scheduleFeedDigest } = cfg
-	const url = `http://localhost:${port}/feeds/${realtimeFeedName}?schedule-feed-digest=${scheduleFeedDigest}`
-	const res = await ky(url, {
-		redirect: 'follow',
-		retry: 0,
-	})
-	const feedEncoded = Buffer.from(await res.arrayBuffer())
-	const feedMessage = FeedMessage.decode(feedEncoded)
-	return feedMessage
+	const { entityType, port, realtimeFeedName, scheduleFeedDigest } = cfg
+	const suffix = entityType ? `/${entityType}` : ''
+	const url = `http://localhost:${port}/feeds/${realtimeFeedName}${suffix}?schedule-feed-digest=${scheduleFeedDigest}`
+	const deadline = Date.now() + 10_000
+	while (true) {
+		const res = await ky(url, {
+			redirect: 'follow',
+			retry: 0,
+			throwHttpErrors: false,
+		})
+		if (res.ok) {
+			const feedEncoded = Buffer.from(await res.arrayBuffer())
+			return FeedMessage.decode(feedEncoded)
+		}
+		if (res.status !== 404 || Date.now() >= deadline) {
+			throw new Error(
+				`failed to fetch matched realtime feed: HTTP ${res.status}`,
+			)
+		}
+		await new Promise((resolve) => setTimeout(resolve, 250))
+	}
 }
 
 const fetchAndParseMetrics = async (cfg: { port: number }) => {
@@ -121,6 +166,23 @@ const fetchAndParseMetrics = async (cfg: { port: number }) => {
 		metricsEncoded[Symbol.iterator](),
 	)
 	return metrics
+}
+
+const waitForScheduleImportedMetric = async (cfg: {
+	feedName: string
+	port: number
+	value: number
+}) => {
+	const deadline = Date.now() + 10_000
+	while (true) {
+		const metrics = await fetchAndParseMetrics({ port: cfg.port })
+		const imported = metricData(metrics.schedule_feed_imported_boolean).find(
+			({ labels }) => labels.feed_name === cfg.feedName,
+		)
+		if (imported?.value === cfg.value) return metrics
+		if (Date.now() >= deadline) return metrics
+		await new Promise((resolve) => setTimeout(resolve, 250))
+	}
 }
 
 const SCHEDULE_FEED_BOOKKEEPING_DB_NAME = `test_${Math.random().toString(16).slice(2, 4)}`
@@ -291,14 +353,16 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		METRICS_SERVER_PORT: String(metricsPort),
 		PGDATABASE: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
 		SCHEDULE_FEED_DB_NAME_PREFIX,
-		SCHEDULE_FEED_REFRESH_INTERVAL: '6', // seconds
-		SCHEDULE_FEED_REFRESH_MIN_INTERVAL: '6', // seconds
+		SCHEDULE_FEED_REFRESH_INTERVAL: '3', // seconds
+		SCHEDULE_FEED_REFRESH_MIN_INTERVAL: '3', // seconds
+		SCHEDULE_FEED_USED_RETENTION: '8', // seconds
 		REALTIME_FEED_FETCH_INTERVAL: '1', // seconds
 		REALTIME_FEED_FETCH_MIN_INTERVAL: '1', // seconds
 	}
 
 	const {
 		port: scheduleFeedPort,
+		getNotModifiedRequestCount,
 		stop: stopServingScheduleFeed,
 		setFile: setScheduleFeed,
 	} = await serveFile('gtfs.zip')
@@ -312,7 +376,9 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	} = await serveFile('gtfs-rt.pb')
 	const realtimeFeedName = 'nyct_subway_1234567' // currently hard-coded by lib/feeds.js
 	env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL = `http://localhost:${realtimeFeedPort}/gtfs-rt.pb`
-	env.NYCT_SUBWAY_ACE_REALTIME_FEED_URL = '-' // disable
+	for (const name of ['ACE', 'BDFM', 'G', 'JZ', 'L', 'NQRW', 'SI']) {
+		env[`NYCT_SUBWAY_${name}_REALTIME_FEED_URL`] = '-'
+	}
 
 	// Both the success as well as the failure metrics each have several variants, for example one for each matching method. Currently, we only assert that there are more successes for a specific matching method than all failures (of that schedule feed digest & route_id) combined.
 	// todo: assert more specifically?
@@ -349,6 +415,26 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	let scheduleFeedDigest = ''
 	setRealtimeFeed(encodeFeedMessage(feedMessage0))
 
+	const staleScheduleDatabaseName = `${SCHEDULE_FEED_DB_NAME_PREFIX}${scheduleFeedName}_missing`
+	{
+		const db = await connectToPostgres({
+			database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
+		})
+		await db.query(`
+			CREATE TABLE latest_successful_imports (
+				db_name TEXT PRIMARY KEY,
+				imported_at INTEGER NOT NULL,
+				feed_digest TEXT NOT NULL
+			)
+		`)
+		await db.query(
+			`INSERT INTO latest_successful_imports (db_name, imported_at, feed_digest)
+			 VALUES ($1, $2, $3)`,
+			[staleScheduleDatabaseName, 1, 'missing-digest'],
+		)
+		await promisify(db.end.bind(db))()
+	}
+
 	// todo: pass in `now`?
 	const pServiceProcess = execa(process.execPath, [PATH_TO_SERVICE], {
 		stdio: 'inherit',
@@ -361,9 +447,11 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	const pTest = (async () => {
 		// check matching with FOO_FEED
 		// todo: get notified about schedule re-import instead of waiting
-		await new Promise((r) => setTimeout(r, 3_000)) // wait for Schedule feed to be imported
 		{
-			const importedScheduleFeeds = await fetchImportedScheduleFeeds({ port })
+			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
+				expectedCount: 1,
+				port,
+			})
 			strictEqual(
 				importedScheduleFeeds.length,
 				1,
@@ -372,6 +460,35 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			const importedFoo = importedScheduleFeeds[0]
 			ok(importedFoo, 'set of imported Schedule feeds should include FOO_FEED')
 			scheduleFeedDigest = importedFoo.scheduleFeedDigest
+
+			const db = await connectToPostgres({
+				database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
+			})
+			const staleImport = await db.query<{ exists: boolean }>(
+				'SELECT EXISTS (SELECT 1 FROM latest_successful_imports WHERE db_name = $1) AS exists',
+				[staleScheduleDatabaseName],
+			)
+			await promisify(db.end.bind(db))()
+			strictEqual(
+				staleImport.rows[0]?.exists,
+				false,
+				'startup should reconcile bookkeeping that points to a missing database',
+			)
+
+			const scheduleFeeds = await ky(
+				`http://localhost:${port}/schedule-feeds`,
+			).json<{
+				latestScheduleFeedDigest: string
+				scheduleFeeds: { feedDigest: string }[]
+			}>()
+			strictEqual(scheduleFeeds.latestScheduleFeedDigest, scheduleFeedDigest)
+			strictEqual(scheduleFeeds.scheduleFeeds.length, 1)
+			const archivedZip = Buffer.from(
+				await ky(
+					`http://localhost:${port}/schedule-feeds/${scheduleFeedDigest}`,
+				).arrayBuffer(),
+			)
+			strictEqual(archivedZip.equals(FOO_FEED), true)
 
 			const { entity: feedEntities } = await fetchAndParseMatchedRealtimeFeed({
 				port,
@@ -399,6 +516,24 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				FOO_TRIP_ID_PREFIX,
 				`VehiclePosition's (feedMessage.entity[1].vehicle) trip_id should begin with "${FOO_TRIP_ID_PREFIX}"`,
 			)
+			const { entity: tripUpdateEntities } =
+				await fetchAndParseMatchedRealtimeFeed({
+					entityType: 'trip-updates',
+					port,
+					realtimeFeedName,
+					scheduleFeedDigest,
+				})
+			strictEqual(tripUpdateEntities.length, 1)
+			ok(tripUpdateEntities[0]?.trip_update)
+			const { entity: vehiclePositionEntities } =
+				await fetchAndParseMatchedRealtimeFeed({
+					entityType: 'vehicle-positions',
+					port,
+					realtimeFeedName,
+					scheduleFeedDigest,
+				})
+			strictEqual(vehiclePositionEntities.length, 1)
+			ok(vehiclePositionEntities[0]?.vehicle)
 			console.info(
 				'Realtime feed (feedMessage0) matched against FOO_FEED looks good ✔︎',
 			)
@@ -430,11 +565,18 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 
 		// check matching with BAR_FEED
 		const fooScheduleFeedDigest = scheduleFeedDigest
-		setScheduleFeed(BAR_FEED)
-		// todo: trigger & get notified about schedule re-import instead of waiting
-		await new Promise((r) => setTimeout(r, 6_000 + 3_000)) // wait for Schedule feed to be (re-)imported
+		const unfinishedImportDbName = `${SCHEDULE_FEED_DB_NAME_PREFIX}${scheduleFeedName}_unfinished`
 		{
-			const importedScheduleFeeds = await fetchImportedScheduleFeeds({ port })
+			const db = await connectToPostgres()
+			await db.query(`CREATE DATABASE "${unfinishedImportDbName}"`)
+			await promisify(db.end.bind(db))()
+		}
+		setScheduleFeed(BAR_FEED)
+		{
+			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
+				expectedCount: 2,
+				port,
+			})
 			strictEqual(
 				importedScheduleFeeds.length,
 				2,
@@ -451,6 +593,18 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			)
 			ok(importedBar, 'set of imported Schedule feeds should include BAR_FEED')
 			scheduleFeedDigest = importedBar.scheduleFeedDigest
+
+			const db = await connectToPostgres()
+			const unfinishedImport = await db.query<{ exists: boolean }>(
+				'SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS exists',
+				[unfinishedImportDbName],
+			)
+			await promisify(db.end.bind(db))()
+			strictEqual(
+				unfinishedImport.rows[0]?.exists,
+				false,
+				'next changed import should clean an unfinished database',
+			)
 
 			const { entity: feedEntities } = await fetchAndParseMatchedRealtimeFeed({
 				port,
@@ -502,6 +656,26 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			)
 		}
 
+		const feedsAfterLeaseExpiry = await waitForImportedScheduleFeeds({
+			expectedCount: 1,
+			port,
+			timeoutMs: 20_000,
+		})
+		strictEqual(
+			feedsAfterLeaseExpiry[0]?.scheduleFeedDigest,
+			scheduleFeedDigest,
+			'latest BAR schedule must remain after the prior FOO lease expires',
+		)
+		const expiredArchiveResponse = await ky(
+			`http://localhost:${port}/schedule-feeds/${fooScheduleFeedDigest}`,
+			{ throwHttpErrors: false },
+		)
+		strictEqual(
+			expiredArchiveResponse.status,
+			404,
+			'expired prior digest archive should be pruned',
+		)
+
 		// modify realtime feed, check matching with BAR_FEED again
 		setRealtimeFeed(encodeFeedMessage(feedMessage1))
 		// todo: trigger & get notified about realtime fetching instead of waiting
@@ -532,8 +706,10 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				'Realtime feed (feedMessage1) matched against BAR_FEED looks good ✔︎',
 			)
 
-			const metrics = await fetchAndParseMetrics({
+			const metrics = await waitForScheduleImportedMetric({
+				feedName: scheduleFeedName,
 				port: metricsPort,
+				value: 0,
 			})
 			debugLogMatchingMetrics(metrics)
 
@@ -546,6 +722,10 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				0,
 				'schedule_feed_imported_boolean should be 0',
 			)
+			ok(
+				getNotModifiedRequestCount() > 0,
+				'unchanged schedule requests should use conditional HTTP and receive 304',
+			)
 
 			checkTripUpdatesMatchingSuccessesAndFailures(
 				metrics,
@@ -554,6 +734,28 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 			checkVehiclePositionsMatchingSuccessesAndFailures(
 				metrics,
 				'stop_times_by_suffix_stop_id_stop_seq',
+			)
+		}
+
+		// A previously seen digest can become current again. The new database must
+		// replace the old one instead of leaving an unreachable duplicate behind.
+		setScheduleFeed(FOO_FEED)
+		await waitForImportedScheduleFeeds({ expectedCount: 2, port })
+		{
+			const db = await connectToPostgres({
+				database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
+			})
+			const duplicateDigestImports = await db.query<{ count: string }>(
+				`SELECT count(*)::text AS count
+				 FROM latest_successful_imports
+				 WHERE feed_digest = $1`,
+				[fooScheduleFeedDigest],
+			)
+			await promisify(db.end.bind(db))()
+			strictEqual(
+				duplicateDigestImports.rows[0]?.count,
+				'1',
+				'a re-imported digest should have exactly one schedule database',
 			)
 		}
 
