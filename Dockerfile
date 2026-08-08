@@ -53,6 +53,8 @@ ADD --link postgis-gtfs-importer ./postgis-gtfs-importer
 
 # install JS dependencies
 RUN cd postgis-gtfs-importer && pnpm install --prod --ignore-workspace --no-lockfile
+ENV PATH="/app/postgis-gtfs-importer/node_modules/.bin:${PATH}"
+RUN gtfs-to-sql --version
 ADD package.json pnpm-lock.yaml pnpm-workspace.yaml /app
 RUN pnpm install --prod --frozen-lockfile && pnpm store prune
 
