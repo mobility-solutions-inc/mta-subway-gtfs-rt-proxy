@@ -42,7 +42,6 @@ The following variables override the upstream URL for each MTA Subway
 Realtime feed group:
 
 - `$NYCT_SUBWAY_1234567_REALTIME_FEED_URL`
-- `$NYCT_SUBWAY_7_REALTIME_FEED_URL`
 - `$NYCT_SUBWAY_ACE_REALTIME_FEED_URL`
 - `$NYCT_SUBWAY_BDFM_REALTIME_FEED_URL`
 - `$NYCT_SUBWAY_G_REALTIME_FEED_URL`
