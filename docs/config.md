@@ -38,6 +38,23 @@ In addition, the `$PG_POOL_SIZE` environment variable determines how many simult
 | `$LOG_LEVEL_MATCHING`               | `warn`                                 |      | How many logs to print regarding the matching of Realtime data against Schedule data.                                                                                                                                                     |
 | `$MATCH_CONCURRENCY`                | `os.cpus().length * 2`                 |      | The number of `FeedEntity`s to match concurrently. Note that this limit is applied _per Realtime feed_. Also note that the matching throughput is also limited by `$PG_POOL_SIZE` as well as the PostgreSQL server's number of CPU cores. |
 
+The following variables override the upstream URL for each MTA Subway
+Realtime feed group:
+
+- `$NYCT_SUBWAY_1234567_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_7_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_ACE_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_BDFM_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_G_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_JZ_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_L_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_NQRW_REALTIME_FEED_URL`
+- `$NYCT_SUBWAY_SI_REALTIME_FEED_URL`
+
+Set an override to `-` to disable that source. The aggregate `nyct_subway` feed
+waits for every configured source; disabled sources are not included in its
+readiness set.
+
 ## `StopTimeUpdate`s storing & restoring
 
 | environment variable                        | default       | unit | description |

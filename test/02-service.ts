@@ -376,7 +376,7 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	} = await serveFile('gtfs-rt.pb')
 	const realtimeFeedName = 'nyct_subway_1234567' // currently hard-coded by lib/feeds.js
 	env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL = `http://localhost:${realtimeFeedPort}/gtfs-rt.pb`
-	for (const name of ['ACE', 'BDFM', 'G', 'JZ', 'L', 'NQRW', 'SI']) {
+	for (const name of ['7', 'ACE', 'BDFM', 'G', 'JZ', 'L', 'NQRW', 'SI']) {
 		env[`NYCT_SUBWAY_${name}_REALTIME_FEED_URL`] = '-'
 	}
 
@@ -449,15 +449,17 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		// todo: get notified about schedule re-import instead of waiting
 		{
 			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
-				expectedCount: 1,
+				expectedCount: 2,
 				port,
 			})
 			strictEqual(
 				importedScheduleFeeds.length,
-				1,
-				'should be exactly 1 imported Schedule feed',
+				2,
+				'should list the source and aggregate for 1 imported Schedule feed',
 			)
-			const importedFoo = importedScheduleFeeds[0]
+			const importedFoo = importedScheduleFeeds.find(
+				({ realtimeFeedName: name }) => name === realtimeFeedName,
+			)
 			ok(importedFoo, 'set of imported Schedule feeds should include FOO_FEED')
 			scheduleFeedDigest = importedFoo.scheduleFeedDigest
 
@@ -534,6 +536,19 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 				})
 			strictEqual(vehiclePositionEntities.length, 1)
 			ok(vehiclePositionEntities[0]?.vehicle)
+			const { entity: aggregateEntities } =
+				await fetchAndParseMatchedRealtimeFeed({
+					port,
+					realtimeFeedName: scheduleFeedName,
+					scheduleFeedDigest,
+				})
+			strictEqual(aggregateEntities.length, 2)
+			ok(
+				aggregateEntities.every(({ id }) =>
+					id.startsWith(`${realtimeFeedName}:`),
+				),
+				'aggregate entity ids should be namespaced by source feed',
+			)
 			console.info(
 				'Realtime feed (feedMessage0) matched against FOO_FEED looks good ✔︎',
 			)
@@ -574,21 +589,23 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		setScheduleFeed(BAR_FEED)
 		{
 			const importedScheduleFeeds = await waitForImportedScheduleFeeds({
-				expectedCount: 2,
+				expectedCount: 4,
 				port,
 			})
 			strictEqual(
 				importedScheduleFeeds.length,
-				2,
-				'should be exactly 2 imported Schedule feeds',
+				4,
+				'should list source and aggregate feeds for 2 Schedule versions',
 			)
 			const importedFoo = importedScheduleFeeds.find(
-				({ scheduleFeedDigest }) =>
+				({ realtimeFeedName: name, scheduleFeedDigest }) =>
+					name === realtimeFeedName &&
 					scheduleFeedDigest === fooScheduleFeedDigest,
 			)
 			ok(importedFoo, 'set of imported Schedule feeds should include FOO_FEED')
 			const importedBar = importedScheduleFeeds.find(
-				({ scheduleFeedDigest }) =>
+				({ realtimeFeedName: name, scheduleFeedDigest }) =>
+					name === realtimeFeedName &&
 					scheduleFeedDigest !== fooScheduleFeedDigest,
 			)
 			ok(importedBar, 'set of imported Schedule feeds should include BAR_FEED')
@@ -657,7 +674,7 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		}
 
 		const feedsAfterLeaseExpiry = await waitForImportedScheduleFeeds({
-			expectedCount: 1,
+			expectedCount: 2,
 			port,
 			timeoutMs: 20_000,
 		})
@@ -740,7 +757,7 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 		// A previously seen digest can become current again. The new database must
 		// replace the old one instead of leaving an unreachable duplicate behind.
 		setScheduleFeed(FOO_FEED)
-		await waitForImportedScheduleFeeds({ expectedCount: 2, port })
+		await waitForImportedScheduleFeeds({ expectedCount: 4, port })
 		{
 			const db = await connectToPostgres({
 				database: SCHEDULE_FEED_BOOKKEEPING_DB_NAME,
