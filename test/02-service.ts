@@ -376,7 +376,7 @@ test('importing Schedule feed, matching & serving Realtime feed works', async ()
 	} = await serveFile('gtfs-rt.pb')
 	const realtimeFeedName = 'nyct_subway_1234567' // currently hard-coded by lib/feeds.js
 	env.NYCT_SUBWAY_1234567_REALTIME_FEED_URL = `http://localhost:${realtimeFeedPort}/gtfs-rt.pb`
-	for (const name of ['7', 'ACE', 'BDFM', 'G', 'JZ', 'L', 'NQRW', 'SI']) {
+	for (const name of ['ACE', 'BDFM', 'G', 'JZ', 'L', 'NQRW', 'SI']) {
 		env[`NYCT_SUBWAY_${name}_REALTIME_FEED_URL`] = '-'
 	}
 

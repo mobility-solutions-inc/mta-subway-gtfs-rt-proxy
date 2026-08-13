@@ -44,7 +44,6 @@ const NYCT_SUBWAY_FEED: ScheduleFeedConfig = {
 	scheduleFeedUrl: NYCT_SUBWAY_SCHEDULE_FEED_URL,
 	realtimeFeeds: [
 		realtimeFeed('1234567', 'NYCT_SUBWAY_1234567_REALTIME_FEED_URL', 'gtfs'),
-		realtimeFeed('7', 'NYCT_SUBWAY_7_REALTIME_FEED_URL', 'gtfs-7'),
 		realtimeFeed('ace', 'NYCT_SUBWAY_ACE_REALTIME_FEED_URL', 'gtfs-ace'),
 		realtimeFeed('bdfm', 'NYCT_SUBWAY_BDFM_REALTIME_FEED_URL', 'gtfs-bdfm'),
 		realtimeFeed('g', 'NYCT_SUBWAY_G_REALTIME_FEED_URL', 'gtfs-g'),

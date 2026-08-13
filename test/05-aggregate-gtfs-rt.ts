@@ -6,6 +6,7 @@ import {
 	createAggregateFeed,
 	DuplicateAggregateEntityError,
 } from '../lib/aggregate-gtfs-rt.js'
+import { NYCT_SUBWAY_FEED } from '../lib/feeds.js'
 
 const tripEntity = (id: string, routeId: string): FeedEntity => ({
 	id,
@@ -50,6 +51,15 @@ const feed = (
 		},
 	},
 	entity,
+})
+
+test('subway configuration uses the combined numeric source for 7 service', () => {
+	deepStrictEqual(
+		NYCT_SUBWAY_FEED.realtimeFeeds.map(({ realtimeFeedName }) =>
+			realtimeFeedName.replace('nyct_subway_', ''),
+		),
+		['1234567', 'ace', 'bdfm', 'g', 'jz', 'l', 'nqrw', 'si'],
+	)
 })
 
 test('aggregate waits for every source and publishes one full dataset', () => {

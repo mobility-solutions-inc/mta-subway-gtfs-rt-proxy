@@ -130,7 +130,7 @@ If you want to see the logs in a human-readable format, pipe them through `pino-
 ./start.js | ./node_modules/.bin/pino-pretty
 ```
 
-By default, `mta-subway-gtfs-rt-proxy` obtains all nine MTA Subway Realtime feed groups (1/2/3/4/5/6, 7, A/C/E, B/D/F/M, G, J/Z, L, N/Q/R/W, and Staten Island Railway) and matches them against the Schedule feed. You can customize this behaviour, as well as many others, [using environment variables](docs/config.md).
+By default, `mta-subway-gtfs-rt-proxy` obtains all eight MTA Subway Realtime feed groups (1/2/3/4/5/6/7, A/C/E, B/D/F/M, G, J/Z, L, N/Q/R/W, and Staten Island Railway) and matches them against the Schedule feed. The 7 and 7X services are included in MTA's combined numeric `gtfs` source; there is no separate `gtfs-7` source. You can customize this behaviour, as well as many others, [using environment variables](docs/config.md).
 
 ## Related
 
