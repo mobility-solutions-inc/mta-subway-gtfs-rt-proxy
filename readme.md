@@ -95,6 +95,18 @@ only changed content. It always retains the latest digest and retains requested
 digests for 24 hours after their most recent request, allowing a running or
 recently rolled-back OTP graph to continue receiving matching realtime data.
 
+For OpenTripPlanner, use the aggregate Subway endpoints:
+
+- `/feeds/nyct_subway/trip-updates?schedule-feed-digest=:digest`
+- `/feeds/nyct_subway/vehicle-positions?schedule-feed-digest=:digest`
+
+The aggregate is published only after every configured MTA Subway source has
+produced a normalized result for that schedule digest. Each later source refresh
+replaces only that source's contribution. The per-group endpoints, such as
+`/feeds/nyct_subway_ace/trip-updates`, remain available for diagnostics, but
+configuring them as separate full-dataset updaters for one OTP feed ID causes
+the updaters to replace one another.
+
 > [!IMPORTANT]
 > By accessing the MTA feeds, you agree to [their terms and conditions](https://new.mta.info/developers/terms-and-conditions).
 
@@ -118,7 +130,7 @@ If you want to see the logs in a human-readable format, pipe them through `pino-
 ./start.js | ./node_modules/.bin/pino-pretty
 ```
 
-By default, `mta-subway-gtfs-rt-proxy` obtains MTA's Realtime feeds (1/2/3/4/5/6/7 and A/C/E) every 60 seconds and matches them against the Schedule feed. You can customize this behaviour, as well as many others, [using environment variables](docs/config.md).
+By default, `mta-subway-gtfs-rt-proxy` obtains all nine MTA Subway Realtime feed groups (1/2/3/4/5/6, 7, A/C/E, B/D/F/M, G, J/Z, L, N/Q/R/W, and Staten Island Railway) and matches them against the Schedule feed. You can customize this behaviour, as well as many others, [using environment variables](docs/config.md).
 
 ## Related
 

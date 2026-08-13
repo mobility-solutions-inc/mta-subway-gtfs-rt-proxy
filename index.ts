@@ -9,6 +9,7 @@ import type {
 	HttpResponse,
 	ScheduleFeedDatabase,
 } from './lib/types.js'
+import { createAggregateFeed } from './lib/aggregate-gtfs-rt.js'
 import {
 	feedNameDimension,
 	publishCloudWatchMetrics,
@@ -169,6 +170,20 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			scheduleFeedDigest,
 			scheduleFeedDigestSlice,
 		})
+		const aggregateFeed = createAggregateFeed({
+			aggregateFeedName: scheduleFeedName,
+			expectedSourceNames: realtimeFeeds.map(
+				({ realtimeFeedName }) => realtimeFeedName,
+			),
+			scheduleFeedDigestSlice,
+		})
+		const {
+			setFeed: setAggregateFeedMessage,
+			onRequest: serveAggregateFeedOnRequest,
+		} = serveFeed({
+			scheduleFeedDigest,
+			scheduleFeedDigestSlice,
+		})
 
 		const createFeedHandler = (realtimeFeedName: string): FeedHandler => {
 			const __logCtx = {
@@ -210,6 +225,22 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 								realtimeFeedName,
 							)
 							setFeedMessage(feedMessage)
+							const aggregateFeedMessage = aggregateFeed.setSourceFeed(
+								realtimeFeedName,
+								feedMessage,
+							)
+							if (aggregateFeedMessage === null) {
+								logger.debug(
+									{
+										..._logCtx,
+										missingRealtimeFeedNames:
+											aggregateFeed.getMissingSourceNames(),
+									},
+									'aggregate realtime feed is waiting for sources',
+								)
+							} else {
+								setAggregateFeedMessage(aggregateFeedMessage)
+							}
 							lastSuccessfulProcessingAt = Date.now()
 							const sourceTimestamp = feedMessage.header.timestamp
 							const sourceTimestampMs =
@@ -287,6 +318,10 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			const feedHandler = createFeedHandler(realtimeFeedName)
 			feedHandlers.set(realtimeFeedName, feedHandler)
 		}
+		feedHandlers.set(scheduleFeedName, {
+			serveFeed: serveAggregateFeedOnRequest,
+			stop: () => undefined,
+		})
 
 		feedHandlersByScheduleFeedDigest.set(scheduleFeedDigest, {
 			feedHandlers,
@@ -458,7 +493,10 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 				res.end('invalid realtime entity type')
 				return
 			}
-			if (!realtimeFetchersByName.has(realtimeFeedName)) {
+			if (
+				!realtimeFetchersByName.has(realtimeFeedName) &&
+				realtimeFeedName !== scheduleFeedName
+			) {
 				res.statusCode = 404
 				res.end('invalid realtime feed name')
 				return
