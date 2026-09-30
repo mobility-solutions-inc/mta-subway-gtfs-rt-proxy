@@ -33,6 +33,11 @@ const MATCH_CONCURRENCY = process.env.MATCH_CONCURRENCY
 		// Twice the number of cores because we (Node process) do other processing between each PostgreSQL query. Also, there is latency between Node and the PostgreSQL machine, especially with a managed DB.
 		osCpus().length * 2
 
+// Upper bound for acquiring a connection & for each matching query. Without it, a query on a connection that died mid-flight never settles, which blocks the processing of the Realtime feed indefinitely.
+const MATCH_DB_TIMEOUT_MS = process.env.MATCH_DB_TIMEOUT
+	? parseInt(process.env.MATCH_DB_TIMEOUT) * 1000
+	: 5 * 60 * 1000
+
 const parseEncodedFeed = (feedEncoded: Uint8Array): FeedMessage => {
 	// decode feed, validate NyctFeedHeader
 	const feedMessage = gtfsRtBindings.transit_realtime.FeedMessage.toObject(
@@ -83,6 +88,11 @@ const createParseAndProcessFeed = async (
 
 	const db = await connectToPostgres({
 		database: scheduleDatabaseName,
+		connectionTimeoutMillis: MATCH_DB_TIMEOUT_MS,
+		// client-side: settles the query even if the server never responds
+		query_timeout: MATCH_DB_TIMEOUT_MS,
+		// server-side: stops the abandoned query from consuming database resources
+		statement_timeout: MATCH_DB_TIMEOUT_MS,
 	})
 
 	const { matchTripUpdate } = createMatchTripUpdate({

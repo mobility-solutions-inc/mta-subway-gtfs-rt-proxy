@@ -91,13 +91,22 @@ const serveFeed = (cfg: ServeFeedConfig) => {
 			res.writeHead(404, 'feed not initialized yet').end()
 			return
 		}
-		serveBuffer(req, res, selectedFeed, {
-			timeModified,
-			etag,
-			// serve-buffer readme:
-			// > If you *never mutate* the buffer(s) that you pass into `serveBuffer`, you can tell it to *cache* each buffer's compressed version as long as the instance exists […].
-			unmutatedBuffers: true,
-		})
+		serveBuffer(
+			req,
+			res,
+			selectedFeed,
+			{
+				timeModified,
+				etag,
+				// serve-buffer readme:
+				// > If you *never mutate* the buffer(s) that you pass into `serveBuffer`, you can tell it to *cache* each buffer's compressed version as long as the instance exists […].
+				unmutatedBuffers: true,
+			},
+			(err) => {
+				// e.g. ERR_STREAM_UNABLE_TO_PIPE when the client has gone away (e.g. its request timed out) before the body could be piped. serve-buffer's default callback would rethrow it as an unhandled rejection, crashing the process.
+				if (err) res.destroy(err)
+			},
+		)
 	}
 
 	return {

@@ -54,7 +54,14 @@ const connectToPostgres = async (opt: PoolConfig = {}) => {
 	// todo?
 	// > Do not use pool.query if you need transactional integrity: the pool will dispatch every query passed to pool.query on the first available idle client. Transactions within PostgreSQL are scoped to a single client and so dispatching individual queries within a single transaction across multiple, random clients will cause big problems in your app and not work. For more info please read transactions.
 	// https://node-postgres.com/api/pool
-	const db = new Pool(getPgOpts(opt))
+	const db = new Pool(
+		getPgOpts({
+			// Detect connections whose peer has silently gone away (e.g. during a database restart), instead of waiting for a response forever.
+			keepAlive: true,
+			keepAliveInitialDelayMillis: 30_000,
+			...opt,
+		}),
+	)
 	db.on('error', (error) => {
 		logger.warn(
 			{ database: opt.database ?? process.env.PGDATABASE ?? null, error },
