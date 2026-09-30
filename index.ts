@@ -36,6 +36,10 @@ import {
 import { serveFeed } from './lib/serve-gtfs-rt.js'
 
 const SERVICE_LOG_LEVEL = process.env.LOG_LEVEL_SERVICE ?? 'info'
+const REALTIME_PROCESSING_STALL_AFTER_MS = process.env
+	.REALTIME_PROCESSING_STALL_AFTER
+	? parseInt(process.env.REALTIME_PROCESSING_STALL_AFTER) * 1000
+	: 15 * 60 * 1000
 
 const unavailableScheduleFeedRequests = new Counter({
 	name: 'schedule_feed_unavailable_digest_requests_total',
@@ -55,6 +59,7 @@ interface FeedHandler {
 		entityType?: FeedEntityType | null,
 	) => void
 	stop: () => void
+	isStalled: (now: number) => boolean
 }
 
 interface ScheduleFeedHandlers {
@@ -202,6 +207,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			let lastSuccessfulProcessingAt = 0
 			let pendingFeedEncoded: Buffer | null = null
 			let processing = false
+			let processingFeedSince: number | null = null
 			let stopped = false
 
 			const drainRealtimeFeedUpdates = async () => {
@@ -219,6 +225,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 							'processing realtime feed',
 						)
 
+						processingFeedSince = Date.now()
 						try {
 							const feedMessage = await parseAndMatchRealtimeFeed(
 								feedEncoded,
@@ -278,6 +285,8 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 								},
 								'failed to process realtime feed update',
 							)
+						} finally {
+							processingFeedSince = null
 						}
 					}
 				} finally {
@@ -307,9 +316,15 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 				realtimeFeedEvents.removeListener('update', processRealtimeFeed)
 			}
 
+			// A single update that has been processing for this long will most likely never finish, so the feed would stop updating without failing loudly.
+			const isStalled = (now: number) =>
+				processingFeedSince !== null &&
+				now - processingFeedSince > REALTIME_PROCESSING_STALL_AFTER_MS
+
 			return {
 				serveFeed: serveFeedOnRequest,
 				stop: stopListeningToRealtimeFeedUpdates,
+				isStalled,
 			}
 		}
 
@@ -321,6 +336,7 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 		feedHandlers.set(scheduleFeedName, {
 			serveFeed: serveAggregateFeedOnRequest,
 			stop: () => undefined,
+			isStalled: () => false,
 		})
 
 		feedHandlersByScheduleFeedDigest.set(scheduleFeedDigest, {
@@ -431,6 +447,25 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 			}
 		},
 	})
+
+	const getStalledFeeds = () => {
+		const now = Date.now()
+		const stalledFeeds: {
+			scheduleFeedDigest: string
+			realtimeFeedName: string
+		}[] = []
+		for (const [
+			scheduleFeedDigest,
+			{ feedHandlers },
+		] of feedHandlersByScheduleFeedDigest) {
+			for (const [realtimeFeedName, { isStalled }] of feedHandlers) {
+				if (isStalled(now)) {
+					stalledFeeds.push({ scheduleFeedDigest, realtimeFeedName })
+				}
+			}
+		}
+		return stalledFeeds
+	}
 
 	// ## serve matched realtime feeds via HTTP
 
@@ -603,6 +638,21 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 		}
 
 		if (pathComponents[0] === 'live' && pathComponents.length === 1) {
+			// Stalled processing does not recover by itself, so let the environment (e.g. Kubernetes) restart the process.
+			const stalledFeeds = getStalledFeeds()
+			if (stalledFeeds.length > 0) {
+				logger.error(
+					{
+						...logCtx,
+						stalledFeeds,
+						stallAfterMs: REALTIME_PROCESSING_STALL_AFTER_MS,
+					},
+					'realtime feed processing is stalled',
+				)
+				res.statusCode = 503 // Service Unavailable
+				res.end('')
+				return
+			}
 			res.statusCode = 200
 			res.end('')
 			return
@@ -617,9 +667,11 @@ const createService = async (opt: CreateServiceOptions = {}) => {
 							({ checkIfHealthy }) => checkIfHealthy(),
 						),
 					])
-					res.statusCode = statuses.some((status) => status !== true)
-						? 503
-						: 200
+					res.statusCode =
+						statuses.some((status) => status !== true) ||
+						getStalledFeeds().length > 0
+							? 503
+							: 200
 					res.end('')
 				} catch (err) {
 					logger.warn(

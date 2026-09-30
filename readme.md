@@ -89,6 +89,8 @@ pnpm run build
   `GET /feeds/:feed/vehicle-positions?schedule-feed-digest=:digest` serve the
   entity-specific feeds used by OpenTripPlanner.
 - `GET /health` and `GET /ready` expose health and startup readiness.
+- `GET /live` fails once processing a realtime feed update has stalled (see
+  `$REALTIME_PROCESSING_STALL_AFTER`), so that the process gets restarted.
 
 The service checks the MTA supplemented schedule every 15 minutes and imports
 only changed content. It always retains the latest digest and retains requested
