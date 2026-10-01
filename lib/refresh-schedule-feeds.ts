@@ -2,6 +2,7 @@ import { ok } from 'node:assert'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
+import type { SuccessfulImport } from '#postgis-gtfs-importer'
 import type { AddressInfo } from 'node:net'
 import { queryImports } from '#postgis-gtfs-importer'
 import { importGtfsAtomically } from '#postgis-gtfs-importer/import'
@@ -107,19 +108,20 @@ const queryImportedScheduleFeedVersions = async (
 
 	const databaseNamePrefix = `${DB_NAME_PREFIX}${scheduleFeedName}_`
 	await ensureScheduleFeedStore()
-	const { allDbs, latestSuccessfulImports } = await queryImports({
-		databaseNamePrefix,
-		pgOpts: getPgOpts(),
-	})
-	const existingDatabaseNames = new Set(allDbs)
-	const staleImports = latestSuccessfulImports.filter(
-		({ dbName }) => !existingDatabaseNames.has(dbName),
-	)
-	const validImportDatabaseNames = latestSuccessfulImports
-		.filter(({ dbName }) => existingDatabaseNames.has(dbName))
-		.map(({ dbName }) => dbName)
 	const db = await connectToPostgres()
+	let latestSuccessfulImports: SuccessfulImport[]
+	let existingDatabaseNames: Set<string>
 	try {
+		// Pass our pool: given only `pgOpts`, queryImports() opens its own client and never closes it, leaking a connection on every call.
+		const imports = await queryImports({ databaseNamePrefix, db })
+		latestSuccessfulImports = imports.latestSuccessfulImports
+		existingDatabaseNames = new Set(imports.allDbs)
+		const staleImports = latestSuccessfulImports.filter(
+			({ dbName }) => !existingDatabaseNames.has(dbName),
+		)
+		const validImportDatabaseNames = latestSuccessfulImports
+			.filter(({ dbName }) => existingDatabaseNames.has(dbName))
+			.map(({ dbName }) => dbName)
 		const { rows: orphanedArchives } = await db.query<{
 			db_name: string
 			feed_digest: string
