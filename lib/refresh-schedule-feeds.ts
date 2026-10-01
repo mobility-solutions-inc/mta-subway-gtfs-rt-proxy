@@ -145,23 +145,27 @@ const queryImportedScheduleFeedVersions = async (
 			staleBookkeeping.set(dbName, feedDigest)
 		}
 		if (staleBookkeeping.size > 0) {
+			// The transaction must run on a single client: on a Pool, each query may use a different connection.
+			const client = await db.connect()
 			try {
-				await db.query('BEGIN')
+				await client.query('BEGIN')
 				for (const [dbName, feedDigest] of staleBookkeeping) {
 					scheduleLogger.warn(
 						{ feedDigest, scheduleDatabaseName: dbName },
 						'removing bookkeeping for an unavailable schedule database',
 					)
-					await db.query(
+					await client.query(
 						'DELETE FROM latest_successful_imports WHERE db_name = $1',
 						[dbName],
 					)
-					await deleteScheduleFeedArchiveByDatabaseName(dbName, db)
+					await deleteScheduleFeedArchiveByDatabaseName(dbName, client)
 				}
-				await db.query('COMMIT')
+				await client.query('COMMIT')
 			} catch (error) {
-				await db.query('ROLLBACK')
+				await client.query('ROLLBACK')
 				throw error
+			} finally {
+				client.release()
 			}
 		}
 	} finally {
