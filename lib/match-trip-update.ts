@@ -152,10 +152,10 @@ const createMatchTripUpdate = (cfg: MatchConfig) => {
 				logCtx,
 				'cannot match TripUpdate unambiguously, it has no StopTimeUpdate with stop_id & stop_sequence; now matching ambiguously',
 			)
+			someStopTimeUpdate = stopTimeUpdates.find(
+				(sTU) => typeof sTU.stop_id === 'string',
+			)
 		}
-		someStopTimeUpdate = stopTimeUpdates.find(
-			(sTU) => typeof sTU.stop_id === 'string',
-		)
 		if (!someStopTimeUpdate) {
 			logger.warn(
 				logCtx,
