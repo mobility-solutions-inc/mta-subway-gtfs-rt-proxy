@@ -26,7 +26,7 @@ psql -c 'DROP DATABASE "test_mta_2024_03_18"'
 
 source 03-match-prepare.sh 'test_sample_gtfs_feed'
 env PGDATABASE=test_sample_gtfs_feed TRIP_ID_SUFFIX_SEPARATOR='-' \
-	node --test --test-only ../dist/test/03-match.js
+	node --test ../dist/test/03-match.js
 psql -c 'DROP DATABASE "test_sample_gtfs_feed"'
 
 # todo: rename to `10-service-end-to-end`?
