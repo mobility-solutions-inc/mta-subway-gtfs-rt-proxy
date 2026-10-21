@@ -6,6 +6,7 @@ WORKDIR /app
 # eMudhra's emSign intermediate CA keys were compromised in October 2026, see
 # https://bugzilla.mozilla.org/show_bug.cgi?id=2083449.
 # - Alpine's ca-certificates-bundle >= 20261020-r0 no longer trusts the affected emSign roots.
+#   curl & pnpm 12 (Rust) use this system store; it must be upgraded before they download anything.
 # - Node.js < 24.22.1 still trusts emSign ECC Root CA - G3 in its *bundled* root store, so we make
 #   Node use the (patched) system store instead.
 # todo: drop NODE_OPTIONS once the base image ships Node.js >= 24.22.1
