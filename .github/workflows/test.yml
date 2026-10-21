@@ -43,8 +43,11 @@ jobs:
       - name: install prerequisites
         # - curl, jq, unzip & wget are needed for the qsv download script below
         # - moreutils provides sponge, which is needed by postgis-gtfs-importer & test/02-service-prepare.sh
+        # - ca-certificates is upgraded to distrust the compromised eMudhra intermediates (Mozilla bug 2083449)
         run: |
+          sudo apt-get update
           sudo apt install -y \
+            ca-certificates \
             curl \
             jq \
             moreutils \
