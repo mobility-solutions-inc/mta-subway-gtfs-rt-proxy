@@ -3,9 +3,18 @@ FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed
 
 WORKDIR /app
 
+# eMudhra's emSign intermediate CA keys were compromised in October 2026, see
+# https://bugzilla.mozilla.org/show_bug.cgi?id=2083449.
+# - Alpine's ca-certificates-bundle >= 20261020-r0 no longer trusts the affected emSign roots.
+# - Node.js < 24.22.1 still trusts emSign ECC Root CA - G3 in its *bundled* root store, so we make
+#   Node use the (patched) system store instead.
+# todo: drop NODE_OPTIONS once the base image ships Node.js >= 24.22.1
+ENV NODE_OPTIONS=--use-openssl-ca
+
 # install build dependencies
 RUN apk add --update --no-cache \
 	bash \
+	'ca-certificates-bundle>=20261020-r0' \
 	curl \
 	git
 RUN corepack enable
@@ -30,11 +39,16 @@ LABEL org.opencontainers.image.licenses="ISC"
 WORKDIR /app
 RUN corepack enable
 
+# Use the patched system CA store, see the builder stage above.
+ENV NODE_OPTIONS=--use-openssl-ca
+
 # install tools
+# - ca-certificates-bundle >= 20261020-r0 distrusts the compromised emSign roots, see the builder stage above.
 # - bash, ncurses (tput), moreutils (sponge), PostgreSQL 18's psql, unzip & zstd are required by postgis-gtfs-importer.
 # - curl is required by curl-mirror, which is required by postgis-gtfs-importer.
 RUN apk add --update --no-cache \
 	bash \
+	'ca-certificates-bundle>=20261020-r0' \
 	curl \
 	ncurses \
 	moreutils \
