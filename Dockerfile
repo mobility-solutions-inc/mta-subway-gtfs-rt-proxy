@@ -1,15 +1,12 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS builder
+FROM node:24-alpine@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d AS builder
 
 WORKDIR /app
 
 # eMudhra's emSign intermediate CA keys were compromised in October 2026, see
 # https://bugzilla.mozilla.org/show_bug.cgi?id=2083449.
 # - Alpine's ca-certificates-bundle >= 20261020-r0 no longer trusts the affected emSign roots.
-# - Node.js < 24.22.1 still trusts emSign ECC Root CA - G3 in its *bundled* root store, so we make
-#   Node use the (patched) system store instead.
-# todo: drop NODE_OPTIONS once the base image ships Node.js >= 24.22.1
-ENV NODE_OPTIONS=--use-openssl-ca
+# - Node.js >= 24.22.1 no longer trusts emSign ECC Root CA - G3 in its bundled root store.
 
 # install build dependencies
 RUN apk add --update --no-cache \
@@ -26,7 +23,7 @@ RUN pnpm run build
 
 # ---
 
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
+FROM node:24-alpine@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d
 LABEL org.opencontainers.image.title="mta-subway-gtfs-rt-proxy"
 LABEL org.opencontainers.image.description="An HTTP service consolidating & normalizing the MTA (NYCT) Subway GTFS-Realtime feeds."
 LABEL org.opencontainers.image.authors="Ontra Mobility"
@@ -38,9 +35,6 @@ LABEL org.opencontainers.image.licenses="ISC"
 
 WORKDIR /app
 RUN corepack enable
-
-# Use the patched system CA store, see the builder stage above.
-ENV NODE_OPTIONS=--use-openssl-ca
 
 # install tools
 # - ca-certificates-bundle >= 20261020-r0 distrusts the compromised emSign roots, see the builder stage above.
