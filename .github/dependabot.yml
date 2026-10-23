@@ -1,0 +1,30 @@
+# JavaScript dependencies remain with Renovate until Dependabot supports pnpm 12.
+# https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#package-ecosystem
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/New_York
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/New_York
+
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: America/New_York
+    # Match the submodule exclusion in renovate.json.
+    ignore:
+      - dependency-name: python-nyct-gtfs
