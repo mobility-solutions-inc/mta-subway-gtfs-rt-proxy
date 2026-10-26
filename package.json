@@ -24,7 +24,7 @@
 	},
 	"bugs": "https://github.com/mobility-solutions-inc/mta-subway-gtfs-rt-proxy/issues",
 	"license": "ISC",
-	"packageManager": "pnpm@12.13.0",
+	"packageManager": "pnpm@12.15.0",
 	"engines": {
 		"node": ">=24"
 	},
