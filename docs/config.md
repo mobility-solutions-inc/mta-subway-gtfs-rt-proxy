@@ -40,8 +40,9 @@ In addition, the `$PG_POOL_SIZE` environment variable determines how many simult
 | `$MATCH_DB_TIMEOUT`                 | `5 * 60`                               | s    | Maximum time to wait for a database connection, and for each database query, while matching. Keeps a connection that died mid-query from blocking a Realtime feed's processing forever.                                                   |
 | `$REALTIME_PROCESSING_STALL_AFTER`  | `15 * 60`                              | s    | If processing a single Realtime feed update takes longer than this, `/live` and `/health` report failure so that the process gets restarted.                                                                                              |
 
-The following variables override the upstream URL for each MTA Subway
-Realtime feed group:
+By default, each MTA Subway Realtime feed group is fetched from MTA's v2 feeds,
+e.g. `https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct-v2%2Fgtfs-ace`.
+The following variables override the upstream URL for each group:
 
 - `$NYCT_SUBWAY_1234567_REALTIME_FEED_URL`
 - `$NYCT_SUBWAY_ACE_REALTIME_FEED_URL`
