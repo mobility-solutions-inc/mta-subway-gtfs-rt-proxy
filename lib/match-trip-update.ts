@@ -171,23 +171,34 @@ const createMatchTripUpdate = (cfg: MatchConfig) => {
 
 		const isMatch = (scheduleStopTimes: ScheduleStopTime[]) =>
 			scheduleStopTimes.length > 0
-		const scheduleStopTimes = await queryScheduleStopTimes({
-			logger,
-			route_id,
-			start_date: startDate,
-			trip_id: realtimeTripId,
-			stop_id: someStopId,
-			stop_sequence: someStopTimeUpdate.stop_sequence ?? null,
-			scheduleFeedDigestSlice,
-			db,
-			isMatch,
-			matchingSuccesses,
-			matchingFailures,
-			dbQueryTimeSeconds,
-			matchLimit: 1,
-			queryTripStopTimes: true,
-			tripStopTimesLimit: 1000,
-		})
+		const queryTripStopTimes = (stopSequence: number | null) =>
+			queryScheduleStopTimes({
+				logger,
+				route_id,
+				start_date: startDate,
+				trip_id: realtimeTripId,
+				stop_id: someStopId,
+				stop_sequence: stopSequence,
+				scheduleFeedDigestSlice,
+				db,
+				isMatch,
+				matchingSuccesses,
+				matchingFailures,
+				dbQueryTimeSeconds,
+				matchLimit: 1,
+				queryTripStopTimes: true,
+				tripStopTimesLimit: 1000,
+			})
+		const someStopSequence = someStopTimeUpdate.stop_sequence ?? null
+		let scheduleStopTimes = await queryTripStopTimes(someStopSequence)
+		// MTA's v2 feeds number stop_sequence along the train's actual path, so rerouted trips' values don't line up with the Schedule feed's. Fall back to matching by stop_id alone, like with the v1 feeds, which had no stop_sequence.
+		if (!isMatch(scheduleStopTimes) && someStopSequence !== null) {
+			logger.debug(
+				logCtx,
+				'failed to match TripUpdate with stop_sequence, retrying without',
+			)
+			scheduleStopTimes = await queryTripStopTimes(null)
+		}
 
 		if (!isMatch(scheduleStopTimes)) {
 			logger.warn(
@@ -225,27 +236,34 @@ const createMatchTripUpdate = (cfg: MatchConfig) => {
 			// > # StopTimeUpdate
 			// > […] If the same stop_id is visited more than once in a trip, then stop_sequence should be provided in all StopTimeUpdates for that stop_id on that trip.
 			// > https://gtfs.org/realtime/reference/#message-stoptimeupdate
-			const scheduleStopTimesIdx = scheduleStopTimes.findIndex((sT, idx) => {
-				if (idx <= prevScheduleStopTimesIdx) {
-					// We cannot match two Realtime StopTimeUpdates with one Schedule stop_time.
-					return false
-				}
+			const findScheduleStopTimeIdx = (matchStopSequence: boolean) =>
+				scheduleStopTimes.findIndex((sT, idx) => {
+					if (idx <= prevScheduleStopTimesIdx) {
+						// We cannot match two Realtime StopTimeUpdates with one Schedule stop_time.
+						return false
+					}
 
-				// from https://gtfs.org/realtime/reference/#message-stoptimeupdate:
-				// > stop_sequence – Must be the same as in stop_times.txt in the corresponding GTFS [Schedule] feed.
-				// from https://gtfs.org/schedule/reference/#stop_timestxt:
-				// > The values must increase along the trip but do not need to be consecutive.
-				// todo: Does this mean that, in order to support additional (realtime) StopTimeUpdates in between, I *have to* use non-consecutive values in the Schedule feed?
-				if (
-					sT.stop_sequence !== null &&
-					stopSequence !== null &&
-					sT.stop_sequence !== stopSequence
-				) {
-					return false
-				}
+					// from https://gtfs.org/realtime/reference/#message-stoptimeupdate:
+					// > stop_sequence – Must be the same as in stop_times.txt in the corresponding GTFS [Schedule] feed.
+					// from https://gtfs.org/schedule/reference/#stop_timestxt:
+					// > The values must increase along the trip but do not need to be consecutive.
+					// todo: Does this mean that, in order to support additional (realtime) StopTimeUpdates in between, I *have to* use non-consecutive values in the Schedule feed?
+					if (
+						matchStopSequence &&
+						sT.stop_sequence !== null &&
+						stopSequence !== null &&
+						sT.stop_sequence !== stopSequence
+					) {
+						return false
+					}
 
-				return stopId === sT.stop_id
-			})
+					return stopId === sT.stop_id
+				})
+			let scheduleStopTimesIdx = findScheduleStopTimeIdx(true)
+			// See the trip-level fallback above: v2 stop_sequence values of rerouted trips don't line up with the Schedule feed's.
+			if (scheduleStopTimesIdx === -1 && stopSequence !== null) {
+				scheduleStopTimesIdx = findScheduleStopTimeIdx(false)
+			}
 			if (scheduleStopTimesIdx === -1) {
 				stopTimeUpdateMatchingFailures.inc({
 					schedule_feed_digest: scheduleFeedDigestSlice,

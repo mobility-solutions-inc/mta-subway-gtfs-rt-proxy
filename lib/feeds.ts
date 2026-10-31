@@ -28,9 +28,10 @@ const realtimeFeed = (
 	envName: string,
 	upstreamName: string,
 ): RealtimeFeedConfig | null => {
+	// MTA's v2 feeds handle the DST fall-back hour correctly; MTA plans to retire the v1 (`nyct%2F…`) feeds in 2027.
 	const configured =
 		process.env[envName] ??
-		`https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2F${upstreamName}`
+		`https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct-v2%2F${upstreamName}`
 	if (configured === '-') return null
 	return {
 		realtimeFeedName: `nyct_subway_${name}`,
