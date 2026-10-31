@@ -6,7 +6,12 @@ import type { Db, Logger, ScheduleStopTime } from './types.js'
 // Make customizable to allow testing with other GTFS Schedule feeds.
 const TRIP_ID_SUFFIX_SEPARATOR = process.env.TRIP_ID_SUFFIX_SEPARATOR ?? '_'
 
+// Realtime trip IDs ending in the direction, without the path identifier, e.g. `078800_L..S` or `036000_GS.N`.
+const REALTIME_TRIP_ID_WITHOUT_PATH = /\.[NS]$/
+
 interface BuildScheduleStopTimesQueryConfig {
+	// Return each (date, trip_id) at most once, in no particular order. Not supported with queryTripStopTimes.
+	distinctTrips?: boolean
 	isoStartDate: string
 	matchLimit: number
 	queryNameSuffix: string
@@ -40,6 +45,7 @@ const _buildScheduleStopTimesQuery = (
 		matchLimit,
 		queryTripStopTimes,
 		tripStopTimesLimit,
+		distinctTrips = false,
 	} = cfg
 	ok(route_id)
 	ok(stop_id === null || (typeof stop_id === 'string' && stop_id))
@@ -50,9 +56,10 @@ const _buildScheduleStopTimesQuery = (
 	ok(matchLimit)
 	strictEqual(typeof queryTripStopTimes, 'boolean')
 	ok(tripStopTimesLimit)
+	ok(!(distinctTrips && queryTripStopTimes))
 
 	let text = `\
-	SELECT
+	SELECT${distinctTrips ? ' DISTINCT' : ''}
 		"date",
 		trip_id
 	FROM arrivals_departures
@@ -66,7 +73,7 @@ const _buildScheduleStopTimesQuery = (
 	AND ${tripIdFilterClause}
 	-- todo: for now, we don't support frequencies.txt-based trips yet
 	AND frequencies_it = -1
-	ORDER BY stop_sequence_consec ASC
+	${distinctTrips ? '' : 'ORDER BY stop_sequence_consec ASC'}
 	LIMIT $5
 `
 	const values: (number | string)[] = [
@@ -361,6 +368,91 @@ const queryScheduleStopTimes = async (
 
 		const t0 = performance.now()
 		const { rows: scheduleStopTimes } = await db.query<ScheduleStopTime>(query)
+		const matching = isMatch(scheduleStopTimes)
+
+		dbQueryTimeSeconds.observe(
+			{
+				...metricsCtx,
+				success: String(matching),
+				matching_method,
+			},
+			(performance.now() - t0) / 1000,
+		)
+
+		if (matching) {
+			matchingSuccesses.inc({
+				...metricsCtx,
+				matching_method,
+			})
+			return scheduleStopTimes
+		}
+		matchingFailures.inc({
+			...metricsCtx,
+			matching_method,
+		})
+	}
+
+	// As a last resort, match Realtime trip IDs that lack the path identifier by prefix, but only if exactly one Schedule trip matches. For example
+	// - `078800_L..S` in GTFS Realtime, and
+	// - `BFA26GEN-L028-Saturday-00_078800_L..S01R` in GTFS Schedule.
+	// MTA's L & some SIR trips have such IDs.
+	if (REALTIME_TRIP_ID_WITHOUT_PATH.test(trip_id)) {
+		// The separator in front of the origin time keeps e.g. `_78800_L..S` from matching `_078800_L..S01R`.
+		const tripIdLiteral = `${TRIP_ID_SUFFIX_SEPARATOR}${trip_id}`
+
+		// Several Schedule trips may share origin time, route & direction but differ in their paths, e.g. `103550_7..S97R` & `103550_7..S99R`. Fetching up to 2 distinct candidates is enough to tell whether the match is unique.
+		const candidatesQuery = _buildScheduleStopTimesQuery({
+			queryNameSuffix: 'by_prefix_candidates',
+			route_id,
+			stop_id,
+			stop_sequence,
+			isoStartDate,
+			// filter by substring without allowing SQL injections
+			tripIdFilterClause: 'strpos(trip_id, $4) > 0',
+			tripIdLiteral,
+			matchLimit: 2,
+			queryTripStopTimes: false,
+			tripStopTimesLimit,
+			distinctTrips: true,
+		})
+		const matching_method = candidatesQuery.matchingMethod.replace(
+			'by_prefix_candidates',
+			'by_prefix',
+		)
+
+		const t0 = performance.now()
+		const { rows: candidates } =
+			await db.query<ScheduleStopTime>(candidatesQuery)
+		let scheduleStopTimes: ScheduleStopTime[] = []
+		if (candidates.length === 1) {
+			// Query the unique candidate exactly, as if the Realtime trip ID had matched it in the first place.
+			const query = _buildScheduleStopTimesQuery({
+				queryNameSuffix: 'by_prefix',
+				route_id,
+				stop_id,
+				stop_sequence,
+				isoStartDate,
+				tripIdFilterClause: 'trip_id = $4',
+				tripIdLiteral: candidates[0].trip_id,
+				matchLimit,
+				queryTripStopTimes,
+				tripStopTimesLimit,
+			})
+			;({ rows: scheduleStopTimes } = await db.query<ScheduleStopTime>(query))
+		} else if (candidates.length > 1) {
+			logger.warn(
+				{
+					...logCtx,
+					route_id,
+					start_date,
+					trip_id,
+					stop_id,
+					stop_sequence,
+					candidateTripIds: candidates.map((c) => c.trip_id),
+				},
+				'trip_id prefix matches more than one schedule trip, not matching',
+			)
+		}
 		const matching = isMatch(scheduleStopTimes)
 
 		dbQueryTimeSeconds.observe(
