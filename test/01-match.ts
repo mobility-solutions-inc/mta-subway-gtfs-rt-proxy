@@ -322,6 +322,58 @@ test('matchTripUpdate() correctly filter by suffix', async () => {
 	)
 })
 
+test('matchTripUpdate() falls back to a unique trip_id prefix match', async () => {
+	const now = 1710961000_000
+	// The L's Realtime trip IDs lack the path identifier.
+	const tripUpdate = {
+		trip: {
+			trip_id: '090200_L..N',
+			start_date: '20240320',
+			route_id: 'L',
+		},
+		stop_time_update: [
+			{
+				arrival: { time: 1710961410n }, // 2024-03-20T15:03:30-04:00
+				stop_id: 'L28N',
+				stop_sequence: 2,
+			},
+		],
+	}
+	await matchTripUpdate(tripUpdate, { now })
+	strictEqual(
+		tripUpdate.trip.trip_id,
+		'BFA23GEN-L049-Weekday-00_090200_L..N01R',
+	)
+	strictEqual(tripUpdate.stop_time_update[0].stop_sequence, 2)
+})
+
+test('matchTripUpdate() only prefix-matches unambiguously', async () => {
+	const now = 1710966000_000
+	// `103550_7..S` is a prefix of both `…_103550_7..S97R` (local) & `…_103550_7..S99R` (express).
+	const tripUpdateAt = (stop_id: string) => ({
+		trip: {
+			trip_id: '103550_7..S',
+			start_date: '20240320',
+			route_id: '7',
+		},
+		stop_time_update: [{ stop_id }],
+	})
+
+	// Only the local trip stops at 702S.
+	const local = tripUpdateAt('702S')
+	await matchTripUpdate(local, { now })
+	strictEqual(local.trip.trip_id, 'L0S1-7-1064-S02_103550_7..S97R')
+
+	// Both trips stop at 726S.
+	const both = tripUpdateAt('726S')
+	await matchTripUpdate(both, { now })
+	strictEqual(
+		both.trip.trip_id,
+		'103550_7..S',
+		'TripUpdate must not be matched',
+	)
+})
+
 // todo
 test.skip('matching an Alert affecting S03R & N03R works', async () => {
 	const alert = cloneDeep(alert0)
