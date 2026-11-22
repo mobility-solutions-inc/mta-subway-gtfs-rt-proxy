@@ -2,7 +2,9 @@
 	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
 	"extends": ["config:best-practices"],
 	"timezone": "America/New_York",
-	"dependencyDashboard": true,
+	"dependencyDashboard": {
+		"enabled": true
+	},
 	"dependencyDashboardApproval": true,
 	"schedule": ["before 7:00am"],
 	"git-submodules": {
