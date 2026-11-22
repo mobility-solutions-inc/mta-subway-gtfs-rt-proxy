@@ -2,3 +2,10 @@ packages: []
 
 allowBuilds:
   protobufjs: true
+
+# serve-buffer 4.0.0 requires the CommonJS etag API at runtime, but only
+# declares etag as a devDependency. Keep it separate from our direct etag v2.
+packageExtensions:
+  serve-buffer@4.0.0:
+    dependencies:
+      etag: ^1.8.1

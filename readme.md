@@ -67,9 +67,12 @@ By letting consumers send the _digest_ (a.k.a. [hash](https://en.wikipedia.org/w
 
 ## Installation
 
+Use Node.js 26 or newer. Install Corepack explicitly; Node.js 26 does not bundle it.
+
 ```shell
 git clone https://github.com/mobility-solutions-inc/mta-subway-gtfs-rt-proxy.git
 cd mta-subway-gtfs-rt-proxy
+npm install --global corepack@0.36.0
 corepack enable
 pnpm install
 pnpm run build

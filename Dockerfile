@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
-FROM node:24-alpine@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d AS builder
+# syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,8 @@ RUN apk add --update --no-cache \
 	'ca-certificates-bundle>=20261020-r0' \
 	curl \
 	git
-RUN corepack enable
+# Node.js 26 no longer bundles Corepack.
+RUN npm install --global corepack@0.36.0 && corepack enable
 ADD package.json pnpm-lock.yaml pnpm-workspace.yaml /app/
 RUN pnpm install --frozen-lockfile
 # This expects the repo's submodules to be checked out already.
@@ -24,7 +25,7 @@ RUN pnpm run build
 
 # ---
 
-FROM node:24-alpine@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5
 LABEL org.opencontainers.image.title="mta-subway-gtfs-rt-proxy"
 LABEL org.opencontainers.image.description="An HTTP service consolidating & normalizing the MTA (NYCT) Subway GTFS-Realtime feeds."
 LABEL org.opencontainers.image.authors="Ontra Mobility"
@@ -35,7 +36,8 @@ LABEL org.opencontainers.image.revision="main"
 LABEL org.opencontainers.image.licenses="ISC"
 
 WORKDIR /app
-RUN corepack enable
+# Node.js 26 no longer bundles Corepack.
+RUN npm install --global corepack@0.36.0 && corepack enable
 
 # install tools
 # - ca-certificates-bundle >= 20261020-r0 distrusts the compromised emSign roots, see the builder stage above.
