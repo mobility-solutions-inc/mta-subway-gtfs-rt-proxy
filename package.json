@@ -24,13 +24,13 @@
 	},
 	"bugs": "https://github.com/mobility-solutions-inc/mta-subway-gtfs-rt-proxy/issues",
 	"license": "ISC",
-	"packageManager": "pnpm@12.15.0",
+	"packageManager": "pnpm@12.21.0",
 	"engines": {
-		"node": ">=24"
+		"node": ">=26"
 	},
 	"dependencies": {
-		"@aws-sdk/client-cloudwatch": "^3.1152.0",
-		"etag": "^1.8.1",
+		"@aws-sdk/client-cloudwatch": "3.1172.0",
+		"etag": "^2.0.0",
 		"ky": "2.2.0",
 		"lodash": "^4.18.1",
 		"longfn": "^1.3.1",
@@ -38,28 +38,27 @@
 		"pg": "8.23.1",
 		"pg-format": "^1.0.4",
 		"pino": "10.4.0",
-		"prom-client": "^15.1.0",
+		"prom-client": "^15.1.3",
 		"protobufjs": "^8.8.1",
-		"serve-buffer": "^3.0.3"
+		"serve-buffer": "^4.0.0"
 	},
 	"devDependencies": {
 		"@eslint/js": "9.39.5",
 		"@ianvs/prettier-plugin-sort-imports": "4.7.1",
-		"@types/etag": "1.8.4",
-		"@types/lodash": "4.17.26",
-		"@types/node": "24.19.2",
+		"@types/lodash": "4.17.27",
+		"@types/node": "26.6.6",
 		"@types/pg": "8.23.1",
 		"@types/pg-format": "1.0.5",
 		"eslint": "9.39.5",
 		"eslint-plugin-import": "2.32.0",
-		"execa": "10.1.1",
+		"execa": "10.2.1",
 		"pino-pretty": "13.2.0",
-		"prettier": "3.9.10",
+		"prettier": "3.10.1",
 		"prom2javascript": "0.2.0",
 		"protobufjs-cli": "2.7.1",
 		"sample-gtfs-feed": "0.13.0",
 		"typescript": "6.0.3",
-		"typescript-eslint": "8.71.2"
+		"typescript-eslint": "8.73.0"
 	},
 	"scripts": {
 		"test": "./test/index.sh",
