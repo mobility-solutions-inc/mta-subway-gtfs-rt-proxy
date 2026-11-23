@@ -4,9 +4,14 @@ import type { TestContext } from 'node:test'
 import type { QueryConfig } from 'pg'
 import { Pool } from 'pg'
 
-import type { StopTimeUpdate, TripUpdate } from '../lib/types.js'
+import type {
+	StopTimeUpdate,
+	TripUpdate,
+	VehiclePosition,
+} from '../lib/types.js'
 import { createLogger } from '../lib/logger.js'
 import { createMatchTripUpdate } from '../lib/match-trip-update.js'
+import { createMatchVehiclePosition } from '../lib/match-vehicle-position.js'
 
 const queryForStops = async (
 	t: TestContext,
@@ -30,6 +35,7 @@ const queryForStops = async (
 		trip: {
 			trip_id: '103550_7..S',
 			start_date: '20260925',
+			start_time: '17:15:32',
 			route_id: '7',
 		},
 		stop_time_update: stopTimeUpdates,
@@ -65,6 +71,53 @@ test('TripUpdate matching prefers a later stop with a sequence', async (t) => {
 	])
 	assertQueriesWithThenWithoutSequence(queries, '706S', 2)
 })
+
+for (const kind of ['trip-update', 'vehicle-position'] as const) {
+	for (const matched of [true, false]) {
+		test(`${kind} ${matched ? 'omits a changing start_time after matching' : 'preserves start_time without a schedule match'}`, async (t) => {
+			const db = new Pool()
+			t.after(() => db.end())
+			t.mock.method(db, 'query', () =>
+				Promise.resolve({
+					rows: matched
+						? [{ trip_id: 'schedule-trip', stop_id: '705S', stop_sequence: 1 }]
+						: [],
+				}),
+			)
+			const cfg = {
+				db,
+				logger: createLogger('test-start-time', 'silent'),
+				scheduleFeedDigest: 'start-time-test',
+				scheduleFeedDigestSlice: 'start-time-test',
+			}
+			for (const start_time of ['17:15:32', '17:16:02', '25:15:32']) {
+				const trip = {
+					trip_id: '103550_7..S',
+					start_date: '20260925',
+					start_time,
+					route_id: '7',
+				}
+				if (kind === 'trip-update') {
+					const update: TripUpdate = {
+						trip,
+						stop_time_update: [{ stop_id: '705S', stop_sequence: 1 }],
+					}
+					await createMatchTripUpdate(cfg).matchTripUpdate(update)
+				} else {
+					const position: VehiclePosition = {
+						trip,
+						stop_id: '705S',
+						current_stop_sequence: 1,
+					}
+					await createMatchVehiclePosition(cfg).matchVehiclePosition(position)
+				}
+				strictEqual(trip.start_time, matched ? undefined : start_time)
+				strictEqual(trip.trip_id, matched ? 'schedule-trip' : '103550_7..S')
+				strictEqual(trip.start_date, '20260925')
+			}
+		})
+	}
+}
 
 test('TripUpdate matching preserves a first stop with sequence zero', async (t) => {
 	const queries = await queryForStops(t, [

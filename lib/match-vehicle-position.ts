@@ -131,12 +131,11 @@ const createMatchVehiclePosition = (cfg: MatchConfig) => {
 
 		// We want to expose trip IDs matching the GTFS Schedule data.
 		vehiclePosition.trip.trip_id = scheduleStopTime.trip_id
+		// Matching excludes frequency trips. For a matched scheduled trip,
+		// omit MTA's changing start_time rather than contradicting the schedule.
+		delete vehiclePosition.trip.start_time
 
 		vehiclePosition.trip.schedule_relationship = ScheduleRelationship.SCHEDULED
-
-		// > When the trip_id corresponds to a non-frequency-based trip, this field should either be omitted or be equal to the value in the GTFS feed. When the trip_id correponds to a frequency-based trip defined in GTFS frequencies.txt, start_time is required and must be specified for trip updates and vehicle positions.
-		// https://gtfs.org/realtime/reference/#message-tripdescriptor
-		// todo: add start_time
 
 		// todo: add trip.direction_id?
 

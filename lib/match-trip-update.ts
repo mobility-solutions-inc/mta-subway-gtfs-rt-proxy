@@ -215,6 +215,10 @@ const createMatchTripUpdate = (cfg: MatchConfig) => {
 
 		// We want to expose trip IDs matching the GTFS Schedule data.
 		tripUpdate.trip.trip_id = tripId
+		// The matcher only accepts non-frequency schedule trips. MTA's v2
+		// start_time can change between polls and contradict that schedule, so
+		// omit this optional field once the static trip identity is established.
+		delete tripUpdate.trip.start_time
 
 		tripUpdate.trip.schedule_relationship = TripScheduleRelationship.SCHEDULED
 
@@ -330,10 +334,6 @@ const createMatchTripUpdate = (cfg: MatchConfig) => {
 		}
 
 		// NYCT subway feed frequently "forgets" past StopTimeUpdates
-
-		// > When the trip_id corresponds to a non-frequency-based trip, this field should either be omitted or be equal to the value in the GTFS feed. When the trip_id correponds to a frequency-based trip defined in GTFS frequencies.txt, start_time is required and must be specified for trip updates and vehicle positions.
-		// https://gtfs.org/realtime/reference/#message-tripdescriptor
-		// todo: add start_time
 
 		// todo: add trip.direction_id?
 
